@@ -1,4 +1,7 @@
 # SkillPivot configuration for SearchQA benchmark
+# Note: SearchQA is a single-turn question-answering benchmark without an interactive tool environment.
+# Teacher continuation operates in QA takeover mode verified against gold answers with strict Exact Match.
+# Multi-step tool benchmarks connect interactive simulation via adapter.build_continuation_step_fn(case).
 _base_: default.yaml
 
 optimizer:

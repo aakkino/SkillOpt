@@ -865,4 +865,200 @@ def test_skillpivot_config_flattening_and_pipeline_wiring(tmp_path):
         assert "Plan carefully before browsing" in deltas_supra[0]["patch"]["edits"][0]["content"]
 
 
+def test_teacher_continuation_without_env_step_allows_multiturn_finish_recovery():
+    """Verify that absent env_step_fn, teacher tool action returns observation without done=True,
+    allowing subsequent turns to recover and emit FINISH: [gold] to succeed continuation.
+
+    Regression test for round 6 review P1 finding:
+    PairedSuffixCase(ground_truth='4'), teacher turn 1 outputs <action>search docs</action>,
+    teacher turn 2 outputs <action>FINISH: 4</action>.
+    Must NOT terminate after turn 1; must succeed at turn 2 with 2 teacher steps.
+    """
+    engine = TeacherContinuationEngine(
+        max_steps=5,
+        max_retries=1,
+        allow_simulated=False,
+    )
+
+    case = PairedSuffixCase(
+        task_id="recovery_task_4",
+        task_description="Solve the puzzle and find the number.",
+        ground_truth="4",
+        gold_answers=["4"],
+        prefix_steps=[],
+        deviation=DeviationPoint(step_index=1, trough_potential=0.0, pre_mean_potential=0.0, post_mean_potential=0.0),
+    )
+
+    turn_count = 0
+
+    def mock_chat_multiturn(system, user, **kw):
+        nonlocal turn_count
+        turn_count += 1
+        if turn_count == 1:
+            return "<think>Need docs</think><action>search docs</action>", {}
+        else:
+            return "<think>Got it, submit final answer</think><action>FINISH: 4</action>", {}
+
+    res = engine.run_continuation(
+        case,
+        env_step_fn=None,
+        chat_fn=mock_chat_multiturn,
+    )
+
+    assert res.teacher_success is True
+    assert len(res.teacher_suffix) == 2
+    assert turn_count == 2
+    # Turn 1: tool action without env_step_fn
+    assert res.teacher_suffix[0].action == "search docs"
+    assert "No environment step function available" in res.teacher_suffix[0].observation
+    assert res.teacher_suffix[0].done is False
+    assert res.teacher_suffix[0].reward == 0.0
+    assert res.teacher_suffix[0].execution_status == 0
+    # Turn 2: recovered finish action
+    assert "FINISH: 4" in res.teacher_suffix[1].action
+    assert res.teacher_suffix[1].done is True
+    assert res.teacher_suffix[1].reward == 1.0
+    assert res.teacher_suffix[1].execution_status == 1
+
+
+def test_trainer_pipeline_adapter_continuation_step_fn_wiring(tmp_path, monkeypatch):
+    """Verify that Trainer invokes run_skillpivot_reflect_step with adapter,
+    and Pipeline automatically acquires per-task continuation step function from adapter.build_continuation_step_fn."""
+    from skillopt.envs.base import EnvAdapter
+    from tests.test_deviation_detector import MockEmbeddingProvider
+
+    class MockInteractiveAdapter(EnvAdapter):
+        def __init__(self):
+            super().__init__()
+            self.step_history = []
+
+        def build_train_env(self, batch_size, seed, **kwargs):
+            return []
+
+        def build_eval_env(self, env_num, split, seed, **kwargs):
+            return []
+
+        def rollout(self, env_manager, skill_content, out_dir, **kwargs):
+            return []
+
+        def get_task_types(self):
+            return ["interactive"]
+
+        def build_continuation_step_fn(self, case, **kwargs):
+            # Returns a callable that steps through 2 tool actions before terminal success
+            steps_taken = 0
+
+            def _step_fn(action: str):
+                nonlocal steps_taken
+                steps_taken += 1
+                self.step_history.append((case.task_id, action, steps_taken))
+                if steps_taken < 2:
+                    return f"Obs for {action}", False, 0.1
+                return f"Final Obs for {action}", True, 1.0
+
+            return _step_fn
+
+    adapter = MockInteractiveAdapter()
+
+    pred_dir = tmp_path / "pred_adapter_interactive"
+    tid = "task_interactive_01"
+    (pred_dir / tid).mkdir(parents=True, exist_ok=True)
+    conversation = [
+        {"step": 1, "action": "open door", "env_feedback": "door open", "execution_status": 1},
+        {"step": 2, "action": "wrong turn", "env_feedback": "blocked", "execution_status": 0},
+    ]
+    with open(pred_dir / tid / "conversation.json", "w", encoding="utf-8") as f:
+        json.dump(conversation, f)
+
+    rollout_failed = [
+        {
+            "id": tid,
+            "task_description": "Navigate to the goal.",
+            "ground_truth": "",
+            "gold_answers": [],
+            "hard": 0.0,
+            "soft": 0.0,
+        }
+    ]
+
+    action_count = 0
+
+    def mock_chat_interactive(system, user, stage="", **kw):
+        nonlocal action_count
+        if stage == "teacher_continuation":
+            action_count += 1
+            if action_count == 1:
+                return "<think>Step 1</think><action>take tool step 1</action>", {}
+            else:
+                return "<think>Step 2</think><action>take tool step 2</action>", {}
+        elif stage == "contrast_analysis":
+            return json.dumps({
+                "student_mistake": "Wrong turn",
+                "teacher_correction": "Follow path",
+                "skill_gap": "Need navigation rule",
+                "evolution_direction": "Add navigation rule",
+            }), {}
+        elif stage == "delta_generation":
+            return json.dumps({
+                "action": "improve_skill",
+                "target_rule": "Navigation",
+                "content": "Verify door state before moving.",
+                "trigger_condition": "When doorway is encountered",
+                "rationale": "Prevents wrong path",
+            }), {}
+        elif stage == "regression_verification":
+            return json.dumps({
+                "no_regression_score": 0.9,
+                "generalizable_rule_score": 0.9,
+                "critique": "Solid update",
+            }), {}
+        return "", {}
+
+    from skillopt.optimizer.skillpivot import delta_generator, regression_verifier, teacher_continuation
+    monkeypatch.setattr(teacher_continuation, "chat_optimizer", mock_chat_interactive)
+    monkeypatch.setattr(delta_generator, "chat_optimizer", mock_chat_interactive)
+    monkeypatch.setattr(regression_verifier, "chat_optimizer", mock_chat_interactive)
+
+    cfg = {
+        "optimizer_type": "skillpivot",
+        "skillpivot_embedding_backend": "local",
+        "skillpivot_gate_threshold": 0.5,
+        "skillpivot_teacher_max_steps": 5,
+        "skillpivot_success_reward_threshold": 0.0,
+    }
+
+    raw_patches = run_skillpivot_reflect_step(
+        rollout_results=rollout_failed,
+        current_skill="# Navigation Skill",
+        prediction_dir=str(pred_dir),
+        cfg=cfg,
+        adapter=adapter,
+        embedding_provider=MockEmbeddingProvider(),
+        allow_simulated=False,
+    )
+
+    assert len(raw_patches) == 1
+    assert "Verify door state before moving." in raw_patches[0]["patch"]["edits"][0]["content"]
+    assert len(adapter.step_history) == 2
+    assert adapter.step_history[0] == (tid, "take tool step 1", 1)
+    assert adapter.step_history[1] == (tid, "take tool step 2", 2)
+
+
+def test_searchqa_adapter_continuation_hooks_contract():
+    """Verify SearchQAAdapter continuation hooks adhere to single-turn QA contract."""
+    from skillopt.envs.searchqa.adapter import SearchQAAdapter
+
+    sqa_adapter = SearchQAAdapter()
+    assert sqa_adapter.build_continuation_step_fn(None) is None
+
+    eval_fn = sqa_adapter.build_continuation_evaluator_fn(None)
+    assert callable(eval_fn)
+    # Exact match passes
+    assert eval_fn("Albert Einstein", ["Albert Einstein", "Einstein"]) is True
+    assert eval_fn("Einstein", ["Albert Einstein", "Einstein"]) is True
+    # Sub-exact match fails
+    assert eval_fn("40", ["4"]) is False
+    assert eval_fn("", ["Einstein"]) is False
+
+
 

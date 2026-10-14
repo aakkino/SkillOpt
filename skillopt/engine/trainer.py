@@ -100,6 +100,7 @@ def run_skillpivot_reflect_step(
     pipeline: Any = None,
     adapter: Any = None,
     allow_simulated: bool = False,
+    train_env: Any = None,
 ) -> list[dict]:
     """Execute SkillPivot fine-grained deviation detection, teacher continuation,
     paired suffix contrast, and regression gating.
@@ -132,7 +133,15 @@ def run_skillpivot_reflect_step(
         w_div=w_div,
     )
 
-    # If no evaluator is explicitly supplied, configure SearchQA evaluator if applicable
+    # If no evaluator is explicitly supplied, check adapter or fallback to SearchQA evaluator
+    if evaluator_fn is None and adapter is not None and hasattr(adapter, "build_continuation_evaluator_fn"):
+        try:
+            adapter_eval = adapter.build_continuation_evaluator_fn(None)
+            if callable(adapter_eval):
+                evaluator_fn = adapter_eval
+        except Exception:
+            pass
+
     if evaluator_fn is None:
         try:
             from skillopt.envs.searchqa.evaluator import evaluate as searchqa_eval
@@ -261,6 +270,7 @@ def run_skillpivot_reflect_step(
         env_step_fn=env_step_fn,
         evaluator_fn=evaluator_fn,
         allow_simulated=allow_simulated,
+        adapter=adapter,
     )
 
     # 3. Convert accepted deltas to raw_patches compatible with trainer downstream
@@ -1487,6 +1497,7 @@ class ReflACTTrainer:
                             prediction_dir=pred_dir,
                             cfg=cfg,
                             adapter=adapter,
+                            train_env=train_env,
                         )
                     else:
                         raw_patches = adapter.reflect(

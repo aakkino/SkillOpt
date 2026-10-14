@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any, Callable
 
 from skillopt.datasets.base import BatchSpec
 from skillopt.envs.base import EnvAdapter
@@ -94,3 +95,41 @@ class SearchQAAdapter(EnvAdapter):
 
     def get_task_types(self) -> list[str]:
         return ["qa"]
+
+    def build_continuation_step_fn(
+        self,
+        case: Any,
+        **kwargs,
+    ) -> Callable[[str], tuple[str, bool, float]] | None:
+        """SearchQA is a single-turn question-answering benchmark without an interactive tool environment.
+
+        Continuation operates in QA takeover mode verified against gold answers with strict Exact Match.
+        """
+        return None
+
+    def build_continuation_evaluator_fn(
+        self,
+        case: Any,
+        **kwargs,
+    ) -> Callable[[str, Any], bool] | None:
+        """Return SearchQA strict EM evaluator for teacher continuation answer verification."""
+        from skillopt.envs.searchqa.evaluator import evaluate, normalize_answer
+
+        def _searchqa_eval(pred_ans: str, gold_answers: Any) -> bool:
+            norm = normalize_answer(pred_ans)
+            if not norm:
+                return False
+            if isinstance(gold_answers, (list, tuple, set)):
+                gold_list = [str(x) for x in gold_answers]
+            else:
+                gold_list = [str(gold_answers)]
+            expanded_gold = list(gold_list)
+            for g in gold_list:
+                if ":" in g:
+                    tail = g.split(":", 1)[1].strip()
+                    if tail and tail not in expanded_gold:
+                        expanded_gold.append(tail)
+            res = evaluate(pred_ans, expanded_gold)
+            return bool(res.get("em", 0.0) >= 1.0)
+
+        return _searchqa_eval

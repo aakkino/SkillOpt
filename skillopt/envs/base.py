@@ -29,6 +29,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 import os
 import random
+from typing import Any, Callable
 
 from skillopt.datasets.base import BaseDataLoader, BatchSpec
 from skillopt.prompts import load_prompt
@@ -327,3 +328,33 @@ class EnvAdapter(ABC):
             if prompt is not None:
                 return prompt
         return self._load_env_prompt("analyst_success")
+
+    # ── Teacher Continuation Hooks (SkillPivot) ────────────────────────────
+
+    def build_continuation_step_fn(
+        self,
+        case: Any,
+        **kwargs,
+    ) -> Callable[[str], tuple[str, bool, float]] | None:
+        """Build an environment step function for teacher continuation from deviation point t*.
+
+        For interactive environments that maintain or can reconstruct simulation state
+        (e.g., by replaying prefix_steps or restoring checkpoint), override this method
+        to return a callable: action -> (observation: str, is_done: bool, reward: float).
+
+        Default implementation returns None, indicating the environment is stateless,
+        single-turn QA, or operates in direct answer takeover mode.
+        """
+        return None
+
+    def build_continuation_evaluator_fn(
+        self,
+        case: Any,
+        **kwargs,
+    ) -> Callable[[str, Any], bool] | None:
+        """Build a task-specific answer verification evaluator for teacher continuation.
+
+        Default implementation returns None, falling back to built-in exact matching or
+        standard benchmark evaluator.
+        """
+        return None

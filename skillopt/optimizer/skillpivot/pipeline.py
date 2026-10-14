@@ -49,6 +49,7 @@ class SkillPivotPipeline:
         env_step_fn: Callable[[str], tuple[str, bool, float]] | None = None,
         evaluator_fn: Callable[[str, Any], bool] | None = None,
         allow_simulated: bool | None = None,
+        adapter: Any = None,
     ) -> tuple[str, list[SkillDelta], list[RegressionGateResult]]:
         """Run one optimization iteration across a batch of failed cases.
 
@@ -63,12 +64,41 @@ class SkillPivotPipeline:
         sim_allowed = self.allow_simulated if allow_simulated is None else allow_simulated
 
         for case in paired_cases:
+            # Resolve task-specific step function
+            case_env_step_fn = None
+            if callable(env_step_fn):
+                try:
+                    import inspect
+                    sig = inspect.signature(env_step_fn)
+                    if len(sig.parameters) >= 1 and list(sig.parameters.keys())[0] in ("case", "task_case", "paired_case"):
+                        case_env_step_fn = env_step_fn(case)
+                    else:
+                        case_env_step_fn = env_step_fn
+                except Exception:
+                    case_env_step_fn = env_step_fn
+            elif adapter is not None and hasattr(adapter, "build_continuation_step_fn"):
+                try:
+                    case_env_step_fn = adapter.build_continuation_step_fn(case)
+                except Exception as e:
+                    logger.warning(f"Task {case.task_id}: failed to build continuation step fn from adapter: {e}")
+                    case_env_step_fn = None
+
+            # Resolve task-specific evaluator function
+            case_evaluator_fn = evaluator_fn
+            if adapter is not None and hasattr(adapter, "build_continuation_evaluator_fn"):
+                try:
+                    adapter_eval = adapter.build_continuation_evaluator_fn(case)
+                    if adapter_eval is not None:
+                        case_evaluator_fn = adapter_eval
+                except Exception:
+                    pass
+
             # Stage 3: Teacher Continuation (if not already simulated/run)
             if not case.teacher_success or not case.teacher_suffix:
                 case = self.teacher_engine.run_continuation(
                     case,
-                    env_step_fn=env_step_fn,
-                    evaluator_fn=evaluator_fn,
+                    env_step_fn=case_env_step_fn,
+                    evaluator_fn=case_evaluator_fn,
                     allow_simulated=sim_allowed,
                 )
 

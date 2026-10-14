@@ -119,9 +119,19 @@ class TeacherContinuationEngine:
         self.allow_simulated = allow_simulated
         self.success_reward_threshold = success_reward_threshold
 
-    def build_teacher_system_prompt(self, skill_content: str) -> str:
-        """Construct teacher system prompt embedding active skill guidelines."""
+    def build_teacher_system_prompt(self, skill_content: str, task_type: str = "") -> str:
+        """Construct teacher system prompt embedding active skill guidelines and task constraints."""
         skill_section = f"\n\n## Available Skills\n{skill_content.strip()}\n" if skill_content.strip() else ""
+        if str(task_type).strip().lower() in ("qa", "single_turn_qa"):
+            return (
+                "You are an expert Teacher Agent for question-answering task solving.\n"
+                "Your goal is to successfully answer the question by reasoning over the provided context passages.\n"
+                f"{skill_section}\n"
+                "Format your turn using:\n"
+                "<think>your step-by-step reasoning</think>\n"
+                "<action>FINISH: [answer]</action>\n"
+                "Extract and formulate the exact concise answer from the context without unnecessary conversational words."
+            )
         return (
             "You are an expert Teacher Agent for tool-augmented task solving.\n"
             "Your goal is to successfully complete the task by continuing from a previous agent's valid exploration prefix.\n"
@@ -206,7 +216,8 @@ class TeacherContinuationEngine:
             allow_simulated: Explicit flag whether unverified simulated execution is accepted.
         """
         call_fn = chat_fn or chat_optimizer
-        system_prompt = self.build_teacher_system_prompt(case.skill_content)
+        task_type = getattr(case, "task_type", "") or case.extras.get("task_type", "")
+        system_prompt = self.build_teacher_system_prompt(case.skill_content, task_type=task_type)
         base_user_prompt = self.build_teacher_prefix_prompt(case)
         sim_allowed = self.allow_simulated if allow_simulated is None else allow_simulated
 
@@ -296,8 +307,13 @@ class TeacherContinuationEngine:
                         obs = "Answer verified: OK" if step_success else "Answer verification failed: incorrect"
                         exec_st = 1 if step_success else 0
                     else:
-                        obs = "Simulated tool response: OK" if sim_allowed else "No environment step function available"
-                        done = not sim_allowed
+                        obs = (
+                            "Simulated tool response: OK"
+                            if sim_allowed
+                            else "No environment step function available. Tool interaction is unsupported in this environment; please provide the final answer directly via <action>FINISH: [answer]</action>."
+                        )
+                        # Do NOT terminate on non-finish actions in verifiable QA mode; allow multi-turn correction up to max_steps
+                        done = False
                         reward = 0.0
                         exec_st = 1 if sim_allowed else 0
                         step_success = False
