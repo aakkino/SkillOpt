@@ -1776,9 +1776,15 @@ class ReflACTTrainer:
                         original_skill=current_skill,
                         tentative_skill=candidate_skill,
                     )
-                    step_rec["skillpivot_final_gate_result"] = final_gate_res.to_dict()
-                    with open(os.path.join(step_dir, "skillpivot_final_gate_result.json"), "w") as f:
-                        json.dump(final_gate_res.to_dict(), f, indent=2, ensure_ascii=False)
+                    from dataclasses import asdict as _dc_asdict
+                    final_gate_dict = (
+                        final_gate_res.to_dict()
+                        if hasattr(final_gate_res, "to_dict")
+                        else _dc_asdict(final_gate_res)
+                    )
+                    step_rec["skillpivot_final_gate_result"] = final_gate_dict
+                    with open(os.path.join(step_dir, "skillpivot_final_gate_result.json"), "w", encoding="utf-8") as f:
+                        json.dump(final_gate_dict, f, indent=2, ensure_ascii=False)
 
                     if not final_gate_res.is_accepted:
                         print(

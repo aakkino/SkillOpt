@@ -606,3 +606,24 @@ class RegressionGateResult:
             and self.generalizable_rule_score >= self.threshold
         )
 
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize regression gate result to dictionary."""
+        return {
+            "no_regression_score": self.no_regression_score,
+            "generalizable_rule_score": self.generalizable_rule_score,
+            "threshold": self.threshold,
+            "is_accepted": self.is_accepted,
+            "critique": self.critique,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> RegressionGateResult:
+        """Construct regression gate result from dictionary."""
+        return cls(
+            no_regression_score=float(data.get("no_regression_score", 0.0)),
+            generalizable_rule_score=float(data.get("generalizable_rule_score", 0.0)),
+            threshold=float(data.get("threshold", 0.5)),
+            is_accepted=bool(data.get("is_accepted", False)),
+            critique=str(data.get("critique", "")),
+        )
+

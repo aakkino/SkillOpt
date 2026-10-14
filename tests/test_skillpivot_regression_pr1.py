@@ -295,3 +295,214 @@ def test_final_candidate_semantic_gate_rejection():
     assert res.no_regression_score == 0.2
     assert res.generalizable_rule_score == 0.3
     assert "infinite retry regressions" in res.critique
+    # Verify to_dict output
+    d = res.to_dict()
+    assert d["is_accepted"] is False
+    assert d["no_regression_score"] == 0.2
+    assert d["generalizable_rule_score"] == 0.3
+
+
+# ── 6. RegressionGateResult Serialization Round-Trip ─────────────────────────
+
+
+def test_regression_gate_result_serialization():
+    """Verify RegressionGateResult to_dict and from_dict round-trip serialization."""
+    res_accept = RegressionGateResult(
+        no_regression_score=0.88,
+        generalizable_rule_score=0.92,
+        threshold=0.5,
+        critique="Good general rule.",
+    )
+    assert res_accept.is_accepted is True
+    d_accept = res_accept.to_dict()
+    assert d_accept == {
+        "no_regression_score": 0.88,
+        "generalizable_rule_score": 0.92,
+        "threshold": 0.5,
+        "is_accepted": True,
+        "critique": "Good general rule.",
+    }
+
+    # Deserialization
+    reconstructed = RegressionGateResult.from_dict(d_accept)
+    assert reconstructed.is_accepted is True
+    assert reconstructed.no_regression_score == 0.88
+    assert reconstructed.generalizable_rule_score == 0.92
+    assert reconstructed.threshold == 0.5
+    assert reconstructed.critique == "Good general rule."
+
+    # Rejection case
+    res_reject = RegressionGateResult(
+        no_regression_score=0.4,
+        generalizable_rule_score=0.9,
+        threshold=0.5,
+        critique="Potential regression.",
+    )
+    assert res_reject.is_accepted is False
+    d_reject = res_reject.to_dict()
+    assert d_reject["is_accepted"] is False
+    assert RegressionGateResult.from_dict(d_reject).is_accepted is False
+
+
+# ── 7. Trainer SkillPivot Final Candidate Gate Lifecycle ──────────────────────
+
+
+def test_trainer_skillpivot_final_candidate_gate_lifecycle(tmp_path, monkeypatch):
+    """Verify ReflACTTrainer invokes final candidate semantic gate, serializes to_dict() without error,
+    and correctly handles both accepted and rejected branches."""
+    from skillopt.engine.trainer import ReflACTTrainer
+    import skillopt.engine.trainer as trainer_mod
+
+    # Setup temporary skill and output directory
+    skill_file = tmp_path / "init_skill.md"
+    skill_file.write_text("# Initial Skill\n1. Check inputs.")
+
+    cfg_base = {
+        "out_root": str(tmp_path / "run_out"),
+        "skill_init": str(skill_file),
+        "batch_size": 1,
+        "num_epochs": 1,
+        "accumulation": 1,
+        "seed": 42,
+        "merge_batch_size": 2,
+        "train_size": 1,
+        "edit_budget": 2,
+        "eval_test": False,
+        "use_gate": True,
+        "gate_metric": "hard",
+        "gate_mixed_weight": 0.5,
+        "optimizer_type": "skillpivot",
+        "skillpivot_gate_threshold": 0.5,
+        "backend": "openai_compatible",
+        "model_backend": "openai_compatible",
+        "optimizer_backend": "openai_compatible",
+        "target_backend": "openai_compatible",
+        "optimizer_model": "mock-model",
+        "target_model": "mock-model",
+        "openai_compatible_base_url": "https://api.mock.com/v1",
+        "openai_compatible_api_key": "mock-key",
+        "analyst_workers": 1,
+        "sel_env_num": 1,
+        "val_env_num": 1,
+    }
+
+    from skillopt.envs.base import EnvAdapter
+
+    # Common adapter mock
+    class MockAdapter(EnvAdapter):
+        def build_train_env(self, batch_size: int, seed: int, **kwargs):
+            return ["dummy_train_env"]
+
+        def build_eval_env(self, env_num: int, split: str, seed: int, **kwargs):
+            return ["dummy_eval_env"], 1
+
+        def rollout(self, env_manager, skill_content: str, out_dir: str, **kwargs) -> list[dict]:
+            return [{"id": "task_01", "hard": 1.0, "soft": 1.0}]
+
+        def get_task_types(self) -> list[str]:
+            return ["general"]
+
+        def compute_score(self, results):
+            return 1.0, 1.0
+
+    # Ensure run_skillpivot_reflect_step produces a valid edit so candidate_skill != current_skill
+    def mock_reflect_step(*args, **kwargs):
+        return [
+            {
+                "patch": {
+                    "reasoning": "SkillPivot procedural enhancement",
+                    "edits": [
+                        {
+                            "op": "append",
+                            "content": "\n### Procedural Update [improve_skill]\nRule: Validate input before writing.",
+                            "target": "Rule: Validate input before writing.",
+                            "source_type": "failure",
+                        }
+                    ],
+                },
+                "source_type": "failure",
+                "batch_size": 1,
+            }
+        ]
+
+    monkeypatch.setattr(trainer_mod, "run_skillpivot_reflect_step", mock_reflect_step)
+
+    # ── Branch 1: Accepted by final semantic gate ────────────────────────────
+    cfg_accept = dict(cfg_base, out_root=str(tmp_path / "run_accept"))
+
+    def mock_verify_accept(self, original_skill, tentative_skill, delta=None):
+        return RegressionGateResult(
+            no_regression_score=0.95,
+            generalizable_rule_score=0.90,
+            threshold=0.5,
+            critique="Update is solid and generalizable.",
+        )
+
+    monkeypatch.setattr(
+        "skillopt.optimizer.skillpivot.regression_verifier.RegressionGatedVerifier.verify_update",
+        mock_verify_accept,
+    )
+
+    trainer_accept = ReflACTTrainer(cfg_accept, MockAdapter())
+    trainer_accept.train()
+
+    # Verify step 1 produced step_record.json with skillpivot_final_gate_result dict
+    step1_dir = tmp_path / "run_accept" / "steps" / "step_0001"
+    assert step1_dir.exists()
+
+    step_rec_file = step1_dir / "step_record.json"
+    assert step_rec_file.exists()
+    with open(step_rec_file, "r", encoding="utf-8") as f:
+        step_rec = json.load(f)
+
+    assert "skillpivot_final_gate_result" in step_rec
+    gate_res_accept = step_rec["skillpivot_final_gate_result"]
+    assert gate_res_accept["is_accepted"] is True
+    assert gate_res_accept["no_regression_score"] == 0.95
+    assert gate_res_accept["generalizable_rule_score"] == 0.90
+    assert gate_res_accept["critique"] == "Update is solid and generalizable."
+
+    # Verify dedicated skillpivot_final_gate_result.json file
+    gate_json_file = step1_dir / "skillpivot_final_gate_result.json"
+    assert gate_json_file.exists()
+    with open(gate_json_file, "r", encoding="utf-8") as f:
+        gate_json = json.load(f)
+    assert gate_json == gate_res_accept
+
+    # ── Branch 2: Rejected by final semantic gate ────────────────────────────
+    cfg_reject = dict(cfg_base, out_root=str(tmp_path / "run_reject"))
+
+    def mock_verify_reject(self, original_skill, tentative_skill, delta=None):
+        return RegressionGateResult(
+            no_regression_score=0.15,
+            generalizable_rule_score=0.20,
+            threshold=0.5,
+            critique="Causes catastrophic regression.",
+        )
+
+    monkeypatch.setattr(
+        "skillopt.optimizer.skillpivot.regression_verifier.RegressionGatedVerifier.verify_update",
+        mock_verify_reject,
+    )
+
+    trainer_reject = ReflACTTrainer(cfg_reject, MockAdapter())
+    trainer_reject.train()
+
+    step1_reject_dir = tmp_path / "run_reject" / "steps" / "step_0001"
+    assert step1_reject_dir.exists()
+
+    with open(step1_reject_dir / "step_record.json", "r", encoding="utf-8") as f:
+        step_rec_rej = json.load(f)
+
+    assert step_rec_rej["action"] == "reject_by_skillpivot_gate"
+    assert "skillpivot_final_gate_result" in step_rec_rej
+    gate_res_rej = step_rec_rej["skillpivot_final_gate_result"]
+    assert gate_res_rej["is_accepted"] is False
+    assert gate_res_rej["no_regression_score"] == 0.15
+    assert gate_res_rej["critique"] == "Causes catastrophic regression."
+
+    # Verify skill remained unchanged on rejection
+    with open(tmp_path / "run_reject" / "skills" / "skill_v0001.md", "r", encoding="utf-8") as f:
+        v1_skill = f.read()
+    assert v1_skill.strip() == "# Initial Skill\n1. Check inputs.".strip()
+
