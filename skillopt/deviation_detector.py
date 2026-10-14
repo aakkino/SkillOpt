@@ -330,6 +330,8 @@ class DeviationDetector:
         conversation: list[dict],
         ground_truth: str = "",
         *,
+        gold_answers: list[str] | None = None,
+        task_context: str = "",
         task_type: str = "",
         task_description: str = "",
         skill_name: str = "",
@@ -356,6 +358,8 @@ class DeviationDetector:
             task_type=task_type,
             task_description=task_description,
             ground_truth=ground_truth,
+            gold_answers=gold_answers,
+            task_context=task_context,
             skill_name=skill_name,
             skill_content=skill_content,
         )

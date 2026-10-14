@@ -483,6 +483,8 @@ class PairedSuffixCase:
     task_type: str = ""
     task_description: str = ""
     ground_truth: str = ""             # Ground-truth for relevance and verification
+    gold_answers: list[str] = field(default_factory=list)  # Full list of acceptable answers
+    task_context: str = ""             # Evidence/passage context visible to student
     skill_name: str = ""
     skill_content: str = ""            # Active skill snapshot used during rollout
 
@@ -507,6 +509,8 @@ class PairedSuffixCase:
         task_type: str = "",
         task_description: str = "",
         ground_truth: str = "",
+        gold_answers: list[str] | None = None,
+        task_context: str = "",
         skill_name: str = "",
         skill_content: str = "",
     ) -> PairedSuffixCase:
@@ -514,11 +518,14 @@ class PairedSuffixCase:
         t_star = deviation.step_index
         prefix = [s for s in full_steps if s.step < t_star]
         student_sfx = [s for s in full_steps if s.step >= t_star]
+        gold_list = list(gold_answers) if gold_answers is not None else ([ground_truth] if ground_truth else [])
         return cls(
             task_id=task_id,
             task_type=task_type,
             task_description=task_description,
             ground_truth=ground_truth,
+            gold_answers=gold_list,
+            task_context=task_context,
             skill_name=skill_name,
             skill_content=skill_content,
             deviation=deviation,
@@ -534,6 +541,8 @@ class PairedSuffixCase:
             "task_type": self.task_type,
             "task_description": self.task_description,
             "ground_truth": self.ground_truth,
+            "gold_answers": self.gold_answers,
+            "task_context": self.task_context,
             "skill_name": self.skill_name,
             "deviation": self.deviation.to_dict() if self.deviation else None,
             "prefix_steps": [s.to_dict() for s in self.prefix_steps],

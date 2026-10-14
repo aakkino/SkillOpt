@@ -37,26 +37,25 @@ def extract_think(response: str) -> str:
 
 
 def extract_final_answer(text: str) -> str:
-    """Extract candidate final answer from FINISH: action or <answer> tags."""
-    m_ans = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL | re.IGNORECASE)
-    if m_ans:
-        return m_ans.group(1).strip()
-    m_fin = re.search(r"finish:\s*(.*)", text, re.DOTALL | re.IGNORECASE)
+    """Extract candidate final answer from <answer> tags or FINISH: action."""
+    matches = re.findall(r"<answer>(.*?)</answer>", text, re.DOTALL | re.IGNORECASE)
+    if matches:
+        return matches[-1].strip()
+    m_fin = re.search(r"finish:\s*(.*?)(?:</action>|\n|$)", text, re.DOTALL | re.IGNORECASE)
     if m_fin:
         return m_fin.group(1).strip()
     return ""
 
 
 def default_verify_answer(pred_answer: str, ground_truth: Any) -> bool:
-    """Verify if prediction matches ground truth using normalized token/exact matching."""
+    """Verify if prediction matches ground truth using strict SQuAD-normalized exact matching.
+
+    Rejects empty, punctuation-only, and loose substring or subset matches (e.g. '40' vs '4').
+    Supports single or multiple gold answers, key-value prefixes ('Answer: 4'), and full-token
+    exact phrase matches in sentences ('$5M' in 'revenue is $5M').
+    """
     if not pred_answer or ground_truth is None:
         return False
-    if isinstance(ground_truth, str):
-        gts = [ground_truth]
-    elif isinstance(ground_truth, (list, tuple, set)):
-        gts = [str(x) for x in ground_truth]
-    else:
-        gts = [str(ground_truth)]
 
     def _norm(s: str) -> str:
         s = s.lower().strip()
@@ -65,17 +64,36 @@ def default_verify_answer(pred_answer: str, ground_truth: Any) -> bool:
         return " ".join(s.split())
 
     norm_pred = _norm(pred_answer)
-    pred_tokens = set(norm_pred.split())
+    if not norm_pred:
+        return False
 
-    for gt in gts:
-        norm_gt = _norm(gt)
+    if isinstance(ground_truth, str):
+        gts = [ground_truth]
+    elif isinstance(ground_truth, (list, tuple, set)):
+        gts = [str(x) for x in ground_truth]
+    else:
+        gts = [str(ground_truth)]
+
+    for raw_gt in gts:
+        norm_gt = _norm(raw_gt)
         if not norm_gt:
             continue
-        if norm_pred == norm_gt or norm_pred in norm_gt or norm_gt in norm_pred:
+        # 1. Direct exact match
+        if norm_pred == norm_gt:
             return True
-        gt_tokens = set(norm_gt.split())
-        if pred_tokens and gt_tokens and (pred_tokens.issubset(gt_tokens) or gt_tokens.issubset(pred_tokens)):
-            return True
+        # 2. Key-value prefix format like "Answer: 4" or "Net income: $20M"
+        if ":" in raw_gt:
+            tail_norm = _norm(raw_gt.split(":", 1)[1])
+            if tail_norm and norm_pred == tail_norm:
+                return True
+        # 3. Contiguous token sequence match within a descriptive sentence
+        # (e.g. pred='5m' in gt='revenue is 5m', but NEVER partial digits like '40' in '4')
+        pred_toks = norm_pred.split()
+        gt_toks = norm_gt.split()
+        if pred_toks and len(pred_toks) <= len(gt_toks):
+            for i in range(len(gt_toks) - len(pred_toks) + 1):
+                if gt_toks[i : i + len(pred_toks)] == pred_toks:
+                    return True
     return False
 
 
@@ -113,12 +131,23 @@ class TeacherContinuationEngine:
         )
 
     def build_teacher_prefix_prompt(self, case: PairedSuffixCase) -> str:
-        """Construct the prompt containing task description, shared prefix, and negative reference."""
-        lines = [
-            f"## Task Description\n{case.task_description}\n",
-            "## Exploration History (Shared Prefix)\n",
-            "The student agent has completed the following initial steps:",
-        ]
+        """Construct prompt containing student-visible task context, description, shared prefix, and negative reference."""
+        lines = []
+
+        # Retain student-visible context/evidence without leaking gold answers
+        if case.task_context and "## context" not in case.task_description.lower():
+            lines.append(f"## Task Context (Evidence)\n{case.task_context.strip()}\n")
+
+        if case.task_description:
+            if "## task description" in case.task_description.lower() or "## context" in case.task_description.lower():
+                lines.append(f"{case.task_description.strip()}\n")
+            else:
+                lines.append(f"## Task Description\n{case.task_description.strip()}\n")
+        else:
+            lines.append("## Task Description\n(No task description provided)\n")
+
+        lines.append("## Exploration History (Shared Prefix)\n")
+        lines.append("The student agent has completed the following initial steps:")
 
         if case.prefix_steps:
             for s in case.prefix_steps:
@@ -179,6 +208,13 @@ class TeacherContinuationEngine:
         base_user_prompt = self.build_teacher_prefix_prompt(case)
         sim_allowed = self.allow_simulated if allow_simulated is None else allow_simulated
 
+        target_gts = (
+            case.gold_answers
+            or case.extras.get("gold_answers")
+            or ([case.ground_truth] if case.ground_truth else [])
+        )
+        has_verifiable_target = bool(target_gts) or evaluator_fn is not None
+
         t_star = case.deviation.step_index if case.deviation else len(case.prefix_steps) + 1
 
         for attempt in range(1, self.max_retries + 1):
@@ -223,20 +259,21 @@ class TeacherContinuationEngine:
                         step_success = True
                     elif is_finish or done:
                         # Differentiate episode termination from actual success:
-                        # If reward <= 0, only accept if explicit evaluator verifies the final answer
                         cand_ans = extract_final_answer(action) or extract_final_answer(raw_response) or obs
-                        if evaluator_fn is not None and case.ground_truth:
-                            step_success = bool(evaluator_fn(cand_ans, case.ground_truth))
+                        if evaluator_fn is not None and target_gts:
+                            step_success = bool(evaluator_fn(cand_ans, target_gts))
+                        elif target_gts:
+                            step_success = bool(default_verify_answer(cand_ans, target_gts))
                         else:
                             step_success = False
-                elif case.ground_truth or evaluator_fn is not None:
-                    # No env_step_fn, but verifiable through ground_truth / evaluator
+                elif has_verifiable_target:
+                    # Verifiable through ground_truth / evaluator without env_step_fn
                     if is_finish:
                         cand_ans = extract_final_answer(action) or extract_final_answer(raw_response)
                         if evaluator_fn is not None:
-                            step_success = bool(evaluator_fn(cand_ans, case.ground_truth))
+                            step_success = bool(evaluator_fn(cand_ans, target_gts))
                         else:
-                            step_success = bool(default_verify_answer(cand_ans, case.ground_truth))
+                            step_success = bool(default_verify_answer(cand_ans, target_gts))
 
                         done = True
                         reward = 1.0 if step_success else 0.0

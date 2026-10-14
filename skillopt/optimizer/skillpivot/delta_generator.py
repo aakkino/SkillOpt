@@ -183,9 +183,14 @@ class DeltaGenerator:
 
     @staticmethod
     def apply_delta(original_skill: str, delta: SkillDelta) -> str:
-        """Apply candidate SkillDelta to original skill to produce tentative skill s'."""
+        """Apply candidate SkillDelta to original skill to produce tentative skill s',
+        strictly respecting protected regions (e.g. APPENDIX) identically to downstream apply_patch."""
         if delta.action == "skip" or not delta.content.strip():
             return original_skill
 
         rendered = DeltaGenerator.render_delta_content(delta)
-        return original_skill.rstrip() + "\n\n" + rendered + "\n"
+        try:
+            from skillopt.optimizer.skill import apply_edit
+            return apply_edit(original_skill, {"op": "append", "content": rendered})
+        except Exception:
+            return original_skill.rstrip() + "\n\n" + rendered + "\n"

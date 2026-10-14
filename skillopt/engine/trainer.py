@@ -136,16 +136,31 @@ def run_skillpivot_reflect_step(
     if evaluator_fn is None:
         try:
             from skillopt.envs.searchqa.evaluator import evaluate as searchqa_eval
+            from skillopt.envs.searchqa.evaluator import normalize_answer
 
             def _searchqa_evaluator(pred_ans: str, gold_answers: Any) -> bool:
+                # Reject empty or punctuation-only answer
+                norm = normalize_answer(pred_ans)
+                if not norm:
+                    return False
+
                 if isinstance(gold_answers, str):
                     gold_list = [gold_answers]
                 elif isinstance(gold_answers, (list, tuple, set)):
                     gold_list = [str(x) for x in gold_answers]
                 else:
                     gold_list = [str(gold_answers)]
-                res = searchqa_eval(pred_ans, gold_list)
-                return bool(res.get("em", 0.0) >= 1.0 or res.get("sub_em", 0.0) >= 1.0)
+
+                expanded_gold = list(gold_list)
+                for g in gold_list:
+                    if ":" in g:
+                        tail = g.split(":", 1)[1].strip()
+                        if tail and tail not in expanded_gold:
+                            expanded_gold.append(tail)
+
+                res = searchqa_eval(pred_ans, expanded_gold)
+                # Exact Match only - strictly reject sub_em
+                return bool(res.get("em", 0.0) >= 1.0)
 
             evaluator_fn = _searchqa_evaluator
         except ImportError:
@@ -155,7 +170,8 @@ def run_skillpivot_reflect_step(
     paired_cases = []
     for item in failures:
         tid = str(item.get("id"))
-        conv_path = os.path.join(prediction_dir, tid, "conversation.json")
+        task_dir = os.path.join(prediction_dir, tid)
+        conv_path = os.path.join(task_dir, "conversation.json")
         if not os.path.exists(conv_path):
             continue
         try:
@@ -166,21 +182,66 @@ def run_skillpivot_reflect_step(
         if not conv:
             continue
 
-        gt = item.get("reference_text") or item.get("ground_truth") or item.get("gold_answers") or ""
-        gt_str = str(gt[0]) if isinstance(gt, (list, tuple)) and gt else str(gt)
+        gt = item.get("gold_answers") or item.get("reference_text") or item.get("ground_truth") or ""
+        if isinstance(gt, (list, tuple, set)):
+            gold_list = [str(x) for x in gt if str(x).strip()]
+            gt_str = gold_list[0] if gold_list else ""
+        else:
+            gt_str = str(gt).strip()
+            gold_list = [gt_str] if gt_str else []
+
+        if ":" in gt_str and not item.get("gold_answers"):
+            tail = gt_str.split(":", 1)[1].strip()
+            if tail and tail not in gold_list:
+                gold_list.append(tail)
+
+        task_desc = str(item.get("task_description") or item.get("instruction") or item.get("question") or "")
+        task_context = str(item.get("context") or item.get("passage") or "")
+
+        # Recover student context from saved target_user_prompt.txt without leaking gold info
+        user_prompt_path = os.path.join(task_dir, "target_user_prompt.txt")
+        if os.path.exists(user_prompt_path):
+            try:
+                with open(user_prompt_path, "r", encoding="utf-8") as f:
+                    saved_user_prompt = f.read().strip()
+                if saved_user_prompt:
+                    if "## Context" in saved_user_prompt and "## Question" in saved_user_prompt:
+                        parts = saved_user_prompt.split("## Question", 1)
+                        ctx_part = parts[0].replace("## Context", "").strip()
+                        q_part = parts[1].strip()
+                        if ctx_part and not task_context:
+                            task_context = ctx_part
+                        if q_part and not task_desc:
+                            task_desc = q_part
+                    elif not task_context:
+                        task_context = saved_user_prompt
+            except Exception:
+                pass
+
+        if adapter is not None and not task_context:
+            if hasattr(adapter, "get_context"):
+                try:
+                    task_context = str(adapter.get_context(tid) or "")
+                except Exception:
+                    pass
+            elif hasattr(adapter, "get_task_context"):
+                try:
+                    task_context = str(adapter.get_task_context(tid) or "")
+                except Exception:
+                    pass
 
         case = detector.slice_trajectory(
             task_id=tid,
             conversation=conv,
             ground_truth=gt_str,
+            gold_answers=gold_list,
+            task_context=task_context,
             task_type=str(item.get("task_type") or item.get("instruction_type") or ""),
-            task_description=str(item.get("task_description") or item.get("instruction") or item.get("question") or ""),
+            task_description=task_desc,
             skill_name="active_skill",
             skill_content=current_skill,
         )
-        # Store full gold target if list
-        if isinstance(gt, (list, tuple)):
-            case.extras["gold_answers"] = list(gt)
+        case.extras["gold_answers"] = gold_list
         paired_cases.append(case)
 
     if not paired_cases:
@@ -1705,6 +1766,41 @@ class ReflACTTrainer:
                     f"    [5/6 UPDATE] "
                     f"skill_len {len(current_skill)} -> {len(candidate_skill)}"
                 )
+
+                # SkillPivot Final Candidate Semantic Gate Verification
+                if str(cfg.get("optimizer_type", "skillopt")).strip().lower() == "skillpivot" and candidate_skill.strip() != current_skill.strip():
+                    from skillopt.optimizer.skillpivot.regression_verifier import RegressionGatedVerifier
+                    gate_thresh = float(cfg.get("skillpivot_gate_threshold", 0.5))
+                    semantic_verifier = RegressionGatedVerifier(threshold=gate_thresh)
+                    final_gate_res = semantic_verifier.verify_update(
+                        original_skill=current_skill,
+                        tentative_skill=candidate_skill,
+                    )
+                    step_rec["skillpivot_final_gate_result"] = final_gate_res.to_dict()
+                    with open(os.path.join(step_dir, "skillpivot_final_gate_result.json"), "w") as f:
+                        json.dump(final_gate_res.to_dict(), f, indent=2, ensure_ascii=False)
+
+                    if not final_gate_res.is_accepted:
+                        print(
+                            f"    [SkillPivot Gate REJECTED] Final candidate failed semantic gate: "
+                            f"No-Reg={final_gate_res.no_regression_score:.2f}, "
+                            f"Gen-Rule={final_gate_res.generalizable_rule_score:.2f} (threshold={gate_thresh})"
+                        )
+                        candidate_skill = current_skill
+                        step_rec["action"] = "reject_by_skillpivot_gate"
+                        step_rec["current_score"] = current_score
+                        step_rec["best_score"] = best_score
+                        step_rec["best_step"] = best_step
+                        step_rec["skill_len"] = len(current_skill)
+                        step_rec["wall_time_s"] = round(time.time() - step_t0, 1)
+                        history.append(step_rec)
+                        _save_history(out_root, history)
+                        _save_skill(out_root, global_step, current_skill)
+                        _persist_runtime_state(global_step)
+                        with open(os.path.join(step_dir, "step_record.json"), "w") as f:
+                            json.dump(step_rec, f, indent=2, ensure_ascii=False)
+                        print("    [skip] rejected by SkillPivot semantic gate — skill unchanged")
+                        continue
 
                 # ⑥ EVALUATE ───────────────────────────────────────────────
                 t_phase = time.time()
