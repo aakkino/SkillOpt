@@ -1,0 +1,16 @@
+# SkillPivot configuration for SearchQA benchmark
+# Note: SearchQA is a single-turn question-answering benchmark without an interactive tool environment.
+# Teacher continuation operates in QA takeover mode verified against gold answers with strict Exact Match.
+# Multi-step tool benchmarks connect interactive simulation via adapter.build_continuation_step_fn(case).
+_base_: default.yaml
+
+optimizer:
+  type: skillpivot
+  skillpivot_embedding_backend: local  # "local" for all-MiniLM-L6-v2 or "api" for OpenAI-compatible
+  skillpivot_embedding_model: sentence-transformers/all-MiniLM-L6-v2
+  skillpivot_w_exec: 0.4
+  skillpivot_w_prog: 0.4
+  skillpivot_w_div: 0.2
+  skillpivot_teacher_max_steps: 10
+  skillpivot_gate_threshold: 0.5
+  skillpivot_success_reward_threshold: 0.0

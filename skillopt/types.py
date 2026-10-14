@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from dataclasses import fields as dc_fields
+import re
 from typing import Any, Literal
 
 from skillopt.datasets.base import BatchSpec  # noqa: F401
@@ -304,3 +305,325 @@ class SlowUpdateResult:
         if self.update_target:
             d["update_target"] = self.update_target
         return d
+
+
+# ── SkillPivot Extension: Fine-grained Slices & Deviation Types ──────────
+
+@dataclass
+class TrajectoryStep:
+    """Standardized single-step interaction node.
+
+    Compatible with conversation.json records across environments (tool-call
+    or standard ReAct step records).
+    """
+
+    step: int
+    action: str = ""
+    observation: str = ""
+    reasoning: str = ""
+    raw_model_response: str = ""
+    reward: float = 0.0
+    done: bool = False
+    execution_status: int = 1  # 1: success/usable, 0: syntax error/exception/empty (Exec_t)
+
+    @staticmethod
+    def is_system_or_eval(d: dict) -> bool:
+        """Check whether a conversation record is system metadata or evaluation report."""
+        if not isinstance(d, dict):
+            return False
+        role = str(d.get("role", "")).lower()
+        if role in {"system", "evaluator"}:
+            return True
+        msg_type = str(d.get("type", "")).lower()
+        if msg_type in {"system", "eval", "evaluation", "eval_result"}:
+            return True
+        content = str(d.get("content", ""))
+        if "[EVALUATION RESULT]" in content or content.strip().startswith("Exact Match:"):
+            return True
+        return False
+
+    @classmethod
+    def from_dict(cls, d: dict, default_step: int = 0) -> TrajectoryStep:
+        # Tool-call record: {"type": "tool_call", "cmd": ..., "obs": ...}
+        if d.get("type") == "tool_call" or "cmd" in d:
+            obs = str(d.get("obs") or "")
+            action = str(d.get("cmd") or "")
+            is_valid = 1 if action and obs and "error" not in obs.lower() else 0
+            return cls(
+                step=int(d.get("step", default_step)),
+                action=action,
+                observation=obs,
+                reasoning=str(d.get("reasoning") or ""),
+                execution_status=is_valid,
+                done=bool(d.get("done", False)),
+            )
+
+        # Message record (e.g. SearchQA: {"type": "message", "turn": 1, "content": ...})
+        if d.get("type") == "message" or ("content" in d and "action" not in d):
+            content = str(d.get("content") or "")
+            # Extract reasoning (<think>...</think>)
+            think_match = re.search(r"<think>(.*?)</think>", content, re.DOTALL | re.IGNORECASE)
+            reasoning = think_match.group(1).strip() if think_match else ""
+
+            # Extract action / answer
+            action_match = re.search(r"<action>(.*?)</action>", content, re.DOTALL | re.IGNORECASE)
+            answer_match = re.search(r"<answer>(.*?)</answer>", content, re.DOTALL | re.IGNORECASE)
+
+            if action_match:
+                action = action_match.group(1).strip()
+            elif answer_match:
+                action = f"<answer>{answer_match.group(1).strip()}</answer>"
+            else:
+                clean_content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL | re.IGNORECASE).strip()
+                action = clean_content if clean_content else content.strip()
+
+            obs = str(d.get("env_feedback") or d.get("observation") or d.get("obs") or "")
+            if not obs and answer_match:
+                obs = "(final answer generated)"
+
+            step_idx = int(d.get("step") or d.get("turn") or default_step)
+            is_valid = 1 if action and "error" not in action.lower() else 0
+
+            return cls(
+                step=step_idx,
+                action=action,
+                observation=obs,
+                reasoning=reasoning,
+                raw_model_response=content,
+                reward=float(d.get("reward", 0.0)),
+                done=bool(d.get("done", bool(answer_match))),
+                execution_status=is_valid,
+            )
+
+        # Standard Step record: {"step": N, "action": ..., "env_feedback": ...}
+        action = str(d.get("action") or "")
+        obs = str(d.get("env_feedback") or d.get("observation") or "")
+        exec_st = int(d.get("execution_status", 1))
+        if not action or "error" in obs.lower() or obs.strip() == "":
+            exec_st = 0
+
+        return cls(
+            step=int(d.get("step", default_step)),
+            action=action,
+            observation=obs,
+            reasoning=str(d.get("reasoning") or ""),
+            raw_model_response=str(d.get("model_response") or ""),
+            reward=float(d.get("reward", 0.0)),
+            done=bool(d.get("done", False)),
+            execution_status=exec_st,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "step": self.step,
+            "action": self.action,
+            "observation": self.observation,
+            "reasoning": self.reasoning,
+            "raw_model_response": self.raw_model_response,
+            "reward": self.reward,
+            "done": self.done,
+            "execution_status": self.execution_status,
+        }
+
+
+@dataclass
+class StepPotential:
+    """Step progress potential and individual factor scores."""
+
+    step: int
+    exec_score: float      # Exec_t: tool execution validity
+    prog_score: float      # Prog_t: goal relevance positive increase
+    div_score: float       # Div_t: action diversity distance
+    potential: float       # V_t = w1*Exec_t + w2*Prog_t + w3*Div_t
+    is_trough: bool = False
+
+
+@dataclass
+class DeviationPoint:
+    """Deviation point detection decision object."""
+
+    step_index: int                    # Deviation truncation point t* (1-indexed)
+    trough_potential: float            # Potential score at t*
+    pre_mean_potential: float          # Average potential before t* (1 to t*-1)
+    post_mean_potential: float         # Average potential from t* onwards
+    is_confirmed: bool = False         # Confirmed by sustained low potential
+    reason: str = ""                   # Diagnostic rationale
+    diagnostics: list[StepPotential] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "step_index": self.step_index,
+            "trough_potential": self.trough_potential,
+            "pre_mean_potential": self.pre_mean_potential,
+            "post_mean_potential": self.post_mean_potential,
+            "is_confirmed": self.is_confirmed,
+            "reason": self.reason,
+            "diagnostics": [
+                {
+                    "step": p.step,
+                    "exec_score": p.exec_score,
+                    "prog_score": p.prog_score,
+                    "div_score": p.div_score,
+                    "potential": p.potential,
+                    "is_trough": p.is_trough,
+                }
+                for p in self.diagnostics
+            ],
+        }
+
+
+@dataclass
+class PairedSuffixCase:
+    """SkillPivot core paired slice container.
+
+    Holds: prefix_steps (1 to t*-1) + student_suffix (t* to T) + teacher_suffix (t* to t*+K).
+    """
+
+    task_id: str
+    task_type: str = ""
+    task_description: str = ""
+    ground_truth: str = ""             # Ground-truth for relevance and verification
+    gold_answers: list[str] = field(default_factory=list)  # Full list of acceptable answers
+    task_context: str = ""             # Evidence/passage context visible to student
+    skill_name: str = ""
+    skill_content: str = ""            # Active skill snapshot used during rollout
+
+    deviation: DeviationPoint | None = None
+
+    # Three-stage structured slices
+    prefix_steps: list[TrajectoryStep] = field(default_factory=list)      # Steps 1 to t*-1
+    student_suffix: list[TrajectoryStep] = field(default_factory=list)    # Steps t* to T
+    teacher_suffix: list[TrajectoryStep] = field(default_factory=list)    # Teacher continuation (max 10 steps)
+
+    teacher_success: bool = False
+    contrast_summary: str = ""
+    extras: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def slice_from_full_trajectory(
+        cls,
+        task_id: str,
+        full_steps: list[TrajectoryStep],
+        deviation: DeviationPoint,
+        *,
+        task_type: str = "",
+        task_description: str = "",
+        ground_truth: str = "",
+        gold_answers: list[str] | None = None,
+        task_context: str = "",
+        skill_name: str = "",
+        skill_content: str = "",
+    ) -> PairedSuffixCase:
+        """Partition full student trajectory into prefix and student_suffix at t*."""
+        t_star = deviation.step_index
+        prefix = [s for s in full_steps if s.step < t_star]
+        student_sfx = [s for s in full_steps if s.step >= t_star]
+        gold_list = list(gold_answers) if gold_answers is not None else ([ground_truth] if ground_truth else [])
+        return cls(
+            task_id=task_id,
+            task_type=task_type,
+            task_description=task_description,
+            ground_truth=ground_truth,
+            gold_answers=gold_list,
+            task_context=task_context,
+            skill_name=skill_name,
+            skill_content=skill_content,
+            deviation=deviation,
+            prefix_steps=prefix,
+            student_suffix=student_sfx,
+            teacher_suffix=[],
+            teacher_success=False,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "task_type": self.task_type,
+            "task_description": self.task_description,
+            "ground_truth": self.ground_truth,
+            "gold_answers": self.gold_answers,
+            "task_context": self.task_context,
+            "skill_name": self.skill_name,
+            "deviation": self.deviation.to_dict() if self.deviation else None,
+            "prefix_steps": [s.to_dict() for s in self.prefix_steps],
+            "student_suffix": [s.to_dict() for s in self.student_suffix],
+            "teacher_suffix": [s.to_dict() for s in self.teacher_suffix],
+            "teacher_success": self.teacher_success,
+            "contrast_summary": self.contrast_summary,
+            "extras": self.extras,
+        }
+
+
+SkillDeltaAction = Literal["improve_skill", "optimize_description", "skip"]
+
+
+@dataclass
+class SkillDelta:
+    """SkillPivot minimal atomic delta patch."""
+
+    action: SkillDeltaAction
+    skill_name: str = ""
+    target_rule: str = ""
+    content: str = ""
+    trigger_condition: str = ""
+    rationale: str = ""
+    source_case_id: str = ""
+
+    def render_content(self) -> str:
+        """Render candidate SkillDelta to textual representation preserving procedural update header,
+        applicable condition, and rule content."""
+        rule_suffix = f": {self.target_rule.strip()}" if self.target_rule.strip() else ""
+        header = f"### Procedural Update [{self.action}]{rule_suffix}\n"
+        if self.trigger_condition.strip():
+            header += f"> Applicable Condition: {self.trigger_condition.strip()}\n\n"
+        return (header + self.content.strip()).strip()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "action": self.action,
+            "skill_name": self.skill_name,
+            "target_rule": self.target_rule,
+            "content": self.content,
+            "trigger_condition": self.trigger_condition,
+            "rationale": self.rationale,
+            "source_case_id": self.source_case_id,
+        }
+
+
+@dataclass
+class RegressionGateResult:
+    """Prior semantic review gate result."""
+
+    no_regression_score: float         # in [0, 1], required >= 0.5
+    generalizable_rule_score: float    # in [0, 1], required >= 0.5
+    threshold: float = 0.5
+    is_accepted: bool = False
+    critique: str = ""
+
+    def __post_init__(self):
+        self.is_accepted = (
+            self.no_regression_score >= self.threshold
+            and self.generalizable_rule_score >= self.threshold
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize regression gate result to dictionary."""
+        return {
+            "no_regression_score": self.no_regression_score,
+            "generalizable_rule_score": self.generalizable_rule_score,
+            "threshold": self.threshold,
+            "is_accepted": self.is_accepted,
+            "critique": self.critique,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> RegressionGateResult:
+        """Construct regression gate result from dictionary."""
+        return cls(
+            no_regression_score=float(data.get("no_regression_score", 0.0)),
+            generalizable_rule_score=float(data.get("generalizable_rule_score", 0.0)),
+            threshold=float(data.get("threshold", 0.5)),
+            is_accepted=bool(data.get("is_accepted", False)),
+            critique=str(data.get("critique", "")),
+        )
+

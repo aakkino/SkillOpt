@@ -83,6 +83,213 @@ from skillopt.optimizer.update_modes import (
     short_item_summary,
 )
 from skillopt.utils import compute_score, skill_hash
+from skillopt.deviation_detector import DeviationDetector, get_embedding_provider
+from skillopt.optimizer.skillpivot import SkillPivotPipeline
+
+
+# ── SkillPivot Integration Runner ────────────────────────────────────────
+
+def run_skillpivot_reflect_step(
+    rollout_results: list[dict],
+    current_skill: str,
+    prediction_dir: str,
+    cfg: dict,
+    env_step_fn: Any = None,
+    evaluator_fn: Any = None,
+    embedding_provider: Any = None,
+    pipeline: Any = None,
+    adapter: Any = None,
+    allow_simulated: bool = False,
+    train_env: Any = None,
+) -> list[dict]:
+    """Execute SkillPivot fine-grained deviation detection, teacher continuation,
+    paired suffix contrast, and regression gating.
+
+    Returns:
+        List of raw patch dictionaries compatible with the SkillOpt pipeline.
+    """
+    failures = [
+        r for r in rollout_results
+        if not r.get("hard") or float(r.get("hard", 0)) < 1e-9
+    ]
+    if not failures:
+        return []
+
+    # Configure embedding provider & deviation detector
+    if embedding_provider is None:
+        emb_backend = cfg.get("skillpivot_embedding_backend", os.environ.get("EMBEDDING_BACKEND", "local"))
+        emb_model = cfg.get("skillpivot_embedding_model")
+        embedding_provider = get_embedding_provider(backend=emb_backend, model=emb_model)
+
+    w_exec = float(cfg.get("skillpivot_w_exec", 0.4))
+    w_prog = float(cfg.get("skillpivot_w_prog", 0.4))
+    w_div = float(cfg.get("skillpivot_w_div", 0.2))
+    gate_thresh = float(cfg.get("skillpivot_gate_threshold", 0.5))
+
+    detector = DeviationDetector(
+        embedding_provider=embedding_provider,
+        w_exec=w_exec,
+        w_prog=w_prog,
+        w_div=w_div,
+    )
+
+    # Adapter evaluators are resolved per case by Pipeline, with real context.
+    # Standalone callers retain the strict SearchQA-compatible fallback.
+    if evaluator_fn is None and adapter is None:
+        try:
+            from skillopt.envs.searchqa.evaluator import evaluate as searchqa_eval
+            from skillopt.envs.searchqa.evaluator import normalize_answer
+
+            def _searchqa_evaluator(pred_ans: str, gold_answers: Any) -> bool:
+                # Reject empty or punctuation-only answer
+                norm = normalize_answer(pred_ans)
+                if not norm:
+                    return False
+
+                if isinstance(gold_answers, str):
+                    gold_list = [gold_answers]
+                elif isinstance(gold_answers, (list, tuple, set)):
+                    gold_list = [str(x) for x in gold_answers]
+                else:
+                    gold_list = [str(gold_answers)]
+
+                expanded_gold = list(gold_list)
+                for g in gold_list:
+                    if ":" in g:
+                        tail = g.split(":", 1)[1].strip()
+                        if tail and tail not in expanded_gold:
+                            expanded_gold.append(tail)
+
+                res = searchqa_eval(pred_ans, expanded_gold)
+                # Exact Match only - strictly reject sub_em
+                return bool(res.get("em", 0.0) >= 1.0)
+
+            evaluator_fn = _searchqa_evaluator
+        except ImportError:
+            evaluator_fn = None
+
+    # 1. Slice failed trajectories into PairedSuffixCase objects
+    paired_cases = []
+    for item in failures:
+        tid = str(item.get("id"))
+        task_dir = os.path.join(prediction_dir, tid)
+        conv_path = os.path.join(task_dir, "conversation.json")
+        if not os.path.exists(conv_path):
+            continue
+        try:
+            with open(conv_path, "r", encoding="utf-8") as f:
+                conv = json.load(f)
+        except Exception:
+            continue
+        if not conv:
+            continue
+
+        gt = item.get("gold_answers") or item.get("reference_text") or item.get("ground_truth") or ""
+        if isinstance(gt, (list, tuple, set)):
+            gold_list = [str(x) for x in gt if str(x).strip()]
+            gt_str = gold_list[0] if gold_list else ""
+        else:
+            gt_str = str(gt).strip()
+            gold_list = [gt_str] if gt_str else []
+
+        if ":" in gt_str and not item.get("gold_answers"):
+            tail = gt_str.split(":", 1)[1].strip()
+            if tail and tail not in gold_list:
+                gold_list.append(tail)
+
+        task_desc = str(item.get("task_description") or item.get("instruction") or item.get("question") or "")
+        task_context = str(item.get("context") or item.get("passage") or "")
+
+        # Recover student context from saved target_user_prompt.txt without leaking gold info
+        user_prompt_path = os.path.join(task_dir, "target_user_prompt.txt")
+        if os.path.exists(user_prompt_path):
+            try:
+                with open(user_prompt_path, "r", encoding="utf-8") as f:
+                    saved_user_prompt = f.read().strip()
+                if saved_user_prompt:
+                    if "## Context" in saved_user_prompt and "## Question" in saved_user_prompt:
+                        parts = saved_user_prompt.split("## Question", 1)
+                        ctx_part = parts[0].replace("## Context", "").strip()
+                        q_part = parts[1].strip()
+                        if ctx_part and not task_context:
+                            task_context = ctx_part
+                        if q_part and not task_desc:
+                            task_desc = q_part
+                    elif not task_context:
+                        task_context = saved_user_prompt
+            except Exception:
+                pass
+
+        if adapter is not None and not task_context:
+            if hasattr(adapter, "get_context"):
+                try:
+                    task_context = str(adapter.get_context(tid) or "")
+                except Exception:
+                    pass
+            elif hasattr(adapter, "get_task_context"):
+                try:
+                    task_context = str(adapter.get_task_context(tid) or "")
+                except Exception:
+                    pass
+
+        case = detector.slice_trajectory(
+            task_id=tid,
+            conversation=conv,
+            ground_truth=gt_str,
+            gold_answers=gold_list,
+            task_context=task_context,
+            task_type=str(item.get("task_type") or item.get("instruction_type") or ""),
+            task_description=task_desc,
+            skill_name="active_skill",
+            skill_content=current_skill,
+        )
+        case.extras["gold_answers"] = gold_list
+        paired_cases.append(case)
+
+    if not paired_cases:
+        return []
+
+    # 2. Run SkillPivot Pipeline (Teacher Continuation -> Contrast -> Verifier Gate)
+    if pipeline is None:
+        pipeline = SkillPivotPipeline(
+            gate_threshold=gate_thresh,
+            allow_simulated=allow_simulated,
+            success_reward_threshold=float(cfg.get("skillpivot_success_reward_threshold", 0.0)),
+            teacher_max_steps=int(cfg.get("skillpivot_teacher_max_steps", 10)),
+        )
+    _, accepted_deltas, gate_results = pipeline.optimize_step(
+        paired_cases=paired_cases,
+        current_skill=current_skill,
+        env_step_fn=env_step_fn,
+        evaluator_fn=evaluator_fn,
+        allow_simulated=allow_simulated,
+        adapter=adapter,
+        train_env=train_env,
+    )
+
+    # 3. Convert accepted deltas to raw_patches compatible with trainer downstream
+    raw_patches = []
+    for delta in accepted_deltas:
+        rendered_content = delta.render_content()
+        raw_patch = {
+            "patch": {
+                "reasoning": f"SkillPivot [{delta.action}] rule={delta.target_rule}: {delta.rationale}",
+                "edits": [
+                    {
+                        "op": "append",
+                        "content": rendered_content,
+                        "target": delta.target_rule,
+                        "source_type": "failure",
+                    }
+                ],
+            },
+            "source_type": "failure",
+            "batch_size": len(failures),
+        }
+        raw_patches.append(raw_patch)
+
+    return raw_patches
+
 
 # ── Skill-aware reflection: appendix flush ───────────────────────────────────
 
@@ -1277,13 +1484,23 @@ class ReflACTTrainer:
                     # Build step context from buffer
                     step_buffer_context = _format_step_buffer(step_buffer)
 
-                    raw_patches = adapter.reflect(
-                        rollout_results, current_skill, batch_dir,
-                        prediction_dir=pred_dir, patches_dir=patches_dir,
-                        random_seed=batch_seed,
-                        step_buffer_context=step_buffer_context,
-                        meta_skill_context=active_meta_skill,
-                    )
+                    if str(cfg.get("optimizer_type", "skillopt")).strip().lower() == "skillpivot":
+                        raw_patches = run_skillpivot_reflect_step(
+                            rollout_results=rollout_results,
+                            current_skill=current_skill,
+                            prediction_dir=pred_dir,
+                            cfg=cfg,
+                            adapter=adapter,
+                            train_env=train_env,
+                        )
+                    else:
+                        raw_patches = adapter.reflect(
+                            rollout_results, current_skill, batch_dir,
+                            prediction_dir=pred_dir, patches_dir=patches_dir,
+                            random_seed=batch_seed,
+                            step_buffer_context=step_buffer_context,
+                            meta_skill_context=active_meta_skill,
+                        )
                     failure_patches, success_patches = _normalise_patches(
                         raw_patches,
                         update_mode=update_mode,
@@ -1556,6 +1773,47 @@ class ReflACTTrainer:
                     f"    [5/6 UPDATE] "
                     f"skill_len {len(current_skill)} -> {len(candidate_skill)}"
                 )
+
+                # SkillPivot Final Candidate Semantic Gate Verification
+                if str(cfg.get("optimizer_type", "skillopt")).strip().lower() == "skillpivot" and candidate_skill.strip() != current_skill.strip():
+                    from skillopt.optimizer.skillpivot.regression_verifier import RegressionGatedVerifier
+                    gate_thresh = float(cfg.get("skillpivot_gate_threshold", 0.5))
+                    semantic_verifier = RegressionGatedVerifier(threshold=gate_thresh)
+                    final_gate_res = semantic_verifier.verify_update(
+                        original_skill=current_skill,
+                        tentative_skill=candidate_skill,
+                    )
+                    from dataclasses import asdict as _dc_asdict
+                    final_gate_dict = (
+                        final_gate_res.to_dict()
+                        if hasattr(final_gate_res, "to_dict")
+                        else _dc_asdict(final_gate_res)
+                    )
+                    step_rec["skillpivot_final_gate_result"] = final_gate_dict
+                    with open(os.path.join(step_dir, "skillpivot_final_gate_result.json"), "w", encoding="utf-8") as f:
+                        json.dump(final_gate_dict, f, indent=2, ensure_ascii=False)
+
+                    if not final_gate_res.is_accepted:
+                        print(
+                            f"    [SkillPivot Gate REJECTED] Final candidate failed semantic gate: "
+                            f"No-Reg={final_gate_res.no_regression_score:.2f}, "
+                            f"Gen-Rule={final_gate_res.generalizable_rule_score:.2f} (threshold={gate_thresh})"
+                        )
+                        candidate_skill = current_skill
+                        step_rec["action"] = "reject_by_skillpivot_gate"
+                        step_rec["current_score"] = current_score
+                        step_rec["best_score"] = best_score
+                        step_rec["best_step"] = best_step
+                        step_rec["skill_len"] = len(current_skill)
+                        step_rec["wall_time_s"] = round(time.time() - step_t0, 1)
+                        history.append(step_rec)
+                        _save_history(out_root, history)
+                        _save_skill(out_root, global_step, current_skill)
+                        _persist_runtime_state(global_step)
+                        with open(os.path.join(step_dir, "step_record.json"), "w") as f:
+                            json.dump(step_rec, f, indent=2, ensure_ascii=False)
+                        print("    [skip] rejected by SkillPivot semantic gate — skill unchanged")
+                        continue
 
                 # ⑥ EVALUATE ───────────────────────────────────────────────
                 t_phase = time.time()

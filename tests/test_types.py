@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from skillopt.types import Edit, Patch, RolloutResult
+from skillopt.types import Edit, Patch, RegressionGateResult, RolloutResult
 
 # ── Edit ────────────────────────────────────────────────────────────────────
 
@@ -260,3 +260,52 @@ class TestRolloutResultRoundTrip:
 
         assert result.hard == pytest.approx(0.75)
         assert result.to_dict()["hard"] == pytest.approx(0.75)
+
+
+# ── RegressionGateResult ─────────────────────────────────────────────────────
+
+
+class TestRegressionGateResultRoundTrip:
+    """RegressionGateResult.to_dict() / RegressionGateResult.from_dict() round-trip."""
+
+    def test_accepted_round_trip(self) -> None:
+        res = RegressionGateResult(
+            no_regression_score=0.9,
+            generalizable_rule_score=0.85,
+            threshold=0.5,
+            critique="Consistent rule update.",
+        )
+        assert res.is_accepted is True
+        d = res.to_dict()
+        assert d == {
+            "no_regression_score": 0.9,
+            "generalizable_rule_score": 0.85,
+            "threshold": 0.5,
+            "is_accepted": True,
+            "critique": "Consistent rule update.",
+        }
+
+        restored = RegressionGateResult.from_dict(d)
+        assert restored.is_accepted is True
+        assert restored.no_regression_score == 0.9
+        assert restored.generalizable_rule_score == 0.85
+        assert restored.threshold == 0.5
+        assert restored.critique == "Consistent rule update."
+
+    def test_rejected_round_trip(self) -> None:
+        res = RegressionGateResult(
+            no_regression_score=0.3,
+            generalizable_rule_score=0.2,
+            threshold=0.5,
+            critique="Regression detected.",
+        )
+        assert res.is_accepted is False
+        d = res.to_dict()
+        assert d["is_accepted"] is False
+
+        restored = RegressionGateResult.from_dict(d)
+        assert restored.is_accepted is False
+        assert restored.no_regression_score == 0.3
+        assert restored.generalizable_rule_score == 0.2
+        assert restored.critique == "Regression detected."
+

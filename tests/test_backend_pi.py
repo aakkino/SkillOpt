@@ -30,7 +30,9 @@ def test_get_backend_pi_aliases():
 
 
 def test_default_model_from_env(monkeypatch):
+    import shutil
     monkeypatch.setenv("SKILLOPT_SLEEP_PI_MODEL", "zai/glm-5.2")
+    monkeypatch.setattr(shutil, "which", lambda p: "pi")
     be = PiCliBackend()
     assert be.model == "zai/glm-5.2"
     assert be.pi_path == "pi"
