@@ -66,7 +66,29 @@ class SkillPivotPipeline:
         sim_allowed = self.allow_simulated if allow_simulated is None else allow_simulated
 
         for case in paired_cases:
+            last_reset_attempt = [0]
+
+            def _env_reset(attempt: int = 1):
+                if attempt > 1 and last_reset_attempt[0] != attempt:
+                    if adapter is not None and hasattr(adapter, "reset_continuation_env"):
+                        try:
+                            adapter.reset_continuation_env(case, train_env=train_env, attempt=attempt, **kwargs)
+                        except TypeError:
+                            try:
+                                adapter.reset_continuation_env(case, train_env=train_env, attempt=attempt)
+                            except TypeError:
+                                try:
+                                    adapter.reset_continuation_env(case, train_env=train_env)
+                                except TypeError:
+                                    adapter.reset_continuation_env(case)
+                    last_reset_attempt[0] = attempt
+
             def _step_fn_builder(attempt: int = 1):
+                if attempt > 1:
+                    try:
+                        _env_reset(attempt)
+                    except Exception as e:
+                        logger.warning(f"Task {case.task_id}: failed to reset env on attempt {attempt}: {e}")
                 if callable(env_step_fn):
                     try:
                         import inspect
@@ -131,6 +153,7 @@ class SkillPivotPipeline:
                     adapter=adapter,
                     train_env=train_env,
                     env_step_fn_builder=_step_fn_builder,
+                    env_reset_fn=_env_reset,
                 )
 
             if not case.teacher_success:

@@ -11,11 +11,14 @@ Implements Stage 3 of SkillPivot (arXiv:2609.29154):
 """
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, Callable
 
 from skillopt.model import chat_optimizer
 from skillopt.types import PairedSuffixCase, TrajectoryStep
+
+logger = logging.getLogger(__name__)
 
 # ── Helpers for parsing model response ───────────────────────────────────
 
@@ -243,6 +246,43 @@ class TeacherContinuationEngine:
             conversation_history = base_user_prompt
             success = False
 
+            # Reset stateful environment before retry attempts (attempt > 1)
+            did_reset = False
+            if attempt > 1:
+                # 1. Custom env_reset_fn
+                if env_reset_fn is not None:
+                    try:
+                        env_reset_fn(attempt)
+                        did_reset = True
+                    except TypeError:
+                        try:
+                            env_reset_fn()
+                            did_reset = True
+                        except Exception as e:
+                            logger.warning(f"Task {case.task_id}: env_reset_fn error on attempt {attempt}: {e}")
+                    except Exception as e:
+                        logger.warning(f"Task {case.task_id}: env_reset_fn error on attempt {attempt}: {e}")
+
+                # 2. Adapter reset_continuation_env hook
+                if not did_reset and adapter is not None and hasattr(adapter, "reset_continuation_env"):
+                    try:
+                        adapter.reset_continuation_env(case, train_env=train_env, attempt=attempt)
+                        did_reset = True
+                    except TypeError:
+                        try:
+                            adapter.reset_continuation_env(case, train_env=train_env)
+                            did_reset = True
+                        except TypeError:
+                            try:
+                                adapter.reset_continuation_env(case)
+                                did_reset = True
+                            except Exception as e:
+                                logger.warning(f"Task {case.task_id}: adapter.reset_continuation_env error on attempt {attempt}: {e}")
+                        except Exception as e:
+                            logger.warning(f"Task {case.task_id}: adapter.reset_continuation_env error on attempt {attempt}: {e}")
+                    except Exception as e:
+                        logger.warning(f"Task {case.task_id}: adapter.reset_continuation_env error on attempt {attempt}: {e}")
+
             # Resolve / rebuild environment step function for this attempt
             active_env_step_fn = None
             if env_step_fn_builder is not None:
@@ -252,16 +292,6 @@ class TeacherContinuationEngine:
                     logger.warning(f"Task {case.task_id}: env_step_fn_builder error on attempt {attempt}: {e}")
                     active_env_step_fn = None
             elif adapter is not None and hasattr(adapter, "build_continuation_step_fn"):
-                if attempt > 1 and hasattr(adapter, "reset_continuation_env"):
-                    try:
-                        adapter.reset_continuation_env(case, train_env=train_env, attempt=attempt)
-                    except TypeError:
-                        try:
-                            adapter.reset_continuation_env(case)
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
                 try:
                     active_env_step_fn = adapter.build_continuation_step_fn(
                         case,
@@ -278,22 +308,27 @@ class TeacherContinuationEngine:
                     active_env_step_fn = None
             elif env_step_fn is not None:
                 active_env_step_fn = env_step_fn
-                if attempt > 1:
-                    if env_reset_fn is not None:
+
+            # 3. In-situ reset on active step function if not already reset
+            if attempt > 1 and not did_reset and active_env_step_fn is not None:
+                reset_fn = None
+                if hasattr(active_env_step_fn, "reset") and callable(active_env_step_fn.reset):
+                    reset_fn = active_env_step_fn.reset
+                elif hasattr(getattr(active_env_step_fn, "__self__", None), "reset") and callable(getattr(active_env_step_fn, "__self__").reset):
+                    reset_fn = getattr(active_env_step_fn, "__self__").reset
+
+                if reset_fn is not None:
+                    try:
+                        reset_fn(attempt)
+                        did_reset = True
+                    except TypeError:
                         try:
-                            env_reset_fn(attempt)
-                        except TypeError:
-                            env_reset_fn()
-                    elif hasattr(active_env_step_fn, "reset") and callable(active_env_step_fn.reset):
-                        try:
-                            active_env_step_fn.reset(attempt)
-                        except TypeError:
-                            active_env_step_fn.reset()
-                    elif hasattr(getattr(active_env_step_fn, "__self__", None), "reset"):
-                        try:
-                            active_env_step_fn.__self__.reset(attempt)
-                        except TypeError:
-                            active_env_step_fn.__self__.reset()
+                            reset_fn()
+                            did_reset = True
+                        except Exception as e:
+                            logger.warning(f"Task {case.task_id}: active_env_step_fn reset error on attempt {attempt}: {e}")
+                    except Exception as e:
+                        logger.warning(f"Task {case.task_id}: active_env_step_fn reset error on attempt {attempt}: {e}")
 
             for step_offset in range(self.max_steps):
                 current_step_num = t_star + step_offset

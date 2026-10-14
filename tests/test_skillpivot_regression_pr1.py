@@ -1300,5 +1300,245 @@ def test_teacher_continuation_retries_with_stateful_environment_reconstruction()
     assert res.teacher_suffix[0].execution_status == 1
 
 
+# ── 15. Round 8 Regression: Pipeline In-situ Reset Retry & Exception Logging ──
+
+
+def test_pipeline_teacher_continuation_in_situ_reset_retry(monkeypatch):
+    """Verify that when running through the real SkillPivotPipeline.optimize_step,
+    an adapter providing in-situ environment reset (reset_continuation_env) has its reset
+    hook reliably invoked before retry attempt 2, allowing successful teacher continuation
+    without remaining in the terminal state.
+
+    Regression test for round 8 review P1 finding:
+    Prior code passed env_step_fn_builder to run_continuation, causing the engine's elif adapter
+    reset branch to be bypassed and leaving reset_calls empty [].
+    """
+    from skillopt.envs.base import EnvAdapter
+    from skillopt.optimizer.skillpivot.pipeline import SkillPivotPipeline
+    from skillopt.types import DeviationPoint, PairedSuffixCase
+
+    class InSituResetAdapter(EnvAdapter):
+        def __init__(self):
+            super().__init__()
+            self.is_terminated = False
+            self.actions_received = []
+            self.reset_calls = []
+
+        def build_train_env(self, batch_size, seed, **kwargs):
+            return []
+
+        def build_eval_env(self, env_num, split, seed, **kwargs):
+            return []
+
+        def rollout(self, env_manager, skill_content, out_dir, **kwargs):
+            return []
+
+        def get_task_types(self):
+            return ["insitu"]
+
+        def step(self, action: str):
+            self.actions_received.append(action)
+            if self.is_terminated:
+                return "Episode already terminated: invalid action after done=True", True, 0.0
+
+            if action == "bad step":
+                self.is_terminated = True
+                return "Failed step", True, 0.0
+            elif action == "good step":
+                self.is_terminated = True
+                return "Goal achieved successfully!", True, 1.0
+            return "Progress", False, 0.0
+
+        def build_continuation_step_fn(self, case, train_env=None, attempt=1, **kwargs):
+            return self.step
+
+        def reset_continuation_env(self, case, train_env=None, attempt=1, **kwargs):
+            self.reset_calls.append(attempt)
+            self.is_terminated = False
+
+    adapter = InSituResetAdapter()
+
+    attempt_counter = 0
+
+    def mock_chat_retry_pipeline(system, user, stage="", **kw):
+        nonlocal attempt_counter
+        if stage == "teacher_continuation":
+            if attempt_counter == 0:
+                attempt_counter += 1
+                return "<think>Try initial idea</think><action>bad step</action>", {}
+            else:
+                attempt_counter += 1
+                return "<think>Correct approach</think><action>good step</action>", {}
+        elif stage == "contrast_analysis":
+            return json.dumps({
+                "student_mistake": "Failed step",
+                "teacher_correction": "Use good step",
+                "skill_gap": "Need good step guideline",
+                "evolution_direction": "Add rule for good step",
+            }), {}
+        elif stage == "delta_generation":
+            return json.dumps({
+                "action": "improve_skill",
+                "target_rule": "Step Choice",
+                "content": "Always choose good step over bad step.",
+                "trigger_condition": "When choosing steps",
+                "rationale": "Leads to success",
+            }), {}
+        elif stage == "regression_verification":
+            return json.dumps({
+                "no_regression_score": 0.95,
+                "generalizable_rule_score": 0.95,
+                "critique": "Solid update",
+            }), {}
+        return "", {}
+
+    from skillopt.optimizer.skillpivot import delta_generator, regression_verifier, teacher_continuation
+    monkeypatch.setattr(teacher_continuation, "chat_optimizer", mock_chat_retry_pipeline)
+    monkeypatch.setattr(delta_generator, "chat_optimizer", mock_chat_retry_pipeline)
+    monkeypatch.setattr(regression_verifier, "chat_optimizer", mock_chat_retry_pipeline)
+
+    pipeline = SkillPivotPipeline(
+        allow_simulated=False,
+        teacher_max_steps=5,
+    )
+    pipeline.teacher_engine.max_retries = 2
+
+    case = PairedSuffixCase(
+        task_id="task_insitu_pipeline",
+        task_description="Execute good step to accomplish the goal.",
+        ground_truth="",
+        gold_answers=[],
+        prefix_steps=[],
+        deviation=DeviationPoint(step_index=1, trough_potential=0.0, pre_mean_potential=0.0, post_mean_potential=0.0),
+    )
+
+    updated_skill, accepted_deltas, gate_results = pipeline.optimize_step(
+        paired_cases=[case],
+        current_skill="# Initial Skill",
+        adapter=adapter,
+    )
+
+    # Verify teacher succeeded on attempt 2
+    assert case.teacher_success is True
+    # Verify in-situ reset hook was called exactly once for attempt 2
+    assert adapter.reset_calls == [2]
+    assert adapter.actions_received == ["bad step", "good step"]
+    assert len(accepted_deltas) == 1
+    assert "Always choose good step" in updated_skill
+
+    # Also verify direct engine call with the same in-situ adapter
+    adapter_direct = InSituResetAdapter()
+    engine = pipeline.teacher_engine
+    attempt_counter = 0
+    case_direct = PairedSuffixCase(
+        task_id="task_insitu_direct",
+        task_description="Execute good step directly.",
+        ground_truth="",
+        gold_answers=[],
+        prefix_steps=[],
+        deviation=DeviationPoint(step_index=1, trough_potential=0.0, pre_mean_potential=0.0, post_mean_potential=0.0),
+    )
+    res_direct = engine.run_continuation(
+        case_direct,
+        chat_fn=mock_chat_retry_pipeline,
+        adapter=adapter_direct,
+    )
+    assert res_direct.teacher_success is True
+    assert adapter_direct.reset_calls == [2]
+    assert adapter_direct.actions_received == ["bad step", "good step"]
+
+
+def test_teacher_continuation_builder_and_adapter_exception_logging(caplog):
+    """Verify that when env_step_fn_builder or adapter raises an exception during environment
+    reconstruction/reset, the error is safely caught and logged without triggering NameError: name 'logger' is not defined.
+
+    Regression test for round 8 review P2 finding.
+    """
+    import logging
+
+    engine = TeacherContinuationEngine(
+        max_steps=3,
+        max_retries=2,
+        allow_simulated=False,
+    )
+
+    case = PairedSuffixCase(
+        task_id="task_exception_logger",
+        task_description="Task with failing builder.",
+        ground_truth="target_42",
+        gold_answers=["target_42"],
+        prefix_steps=[],
+        deviation=DeviationPoint(step_index=1, trough_potential=0.0, pre_mean_potential=0.0, post_mean_potential=0.0),
+    )
+
+    # 1. env_step_fn_builder raises RuntimeError
+    def failing_builder(attempt: int):
+        raise RuntimeError("checkpoint unavailable")
+
+    def mock_chat_answer(system, user, **kw):
+        return "<think>Done</think><action>FINISH: target_42</action>", {}
+
+    with caplog.at_level(logging.WARNING):
+        res = engine.run_continuation(
+            case,
+            env_step_fn_builder=failing_builder,
+            chat_fn=mock_chat_answer,
+        )
+
+    # Verify no NameError was raised and teacher continuation completed
+    assert res.teacher_success is True
+    assert any("env_step_fn_builder error on attempt 1: checkpoint unavailable" in r.message for r in caplog.records)
+
+    caplog.clear()
+
+    # 2. adapter.build_continuation_step_fn raises RuntimeError
+    class FailingAdapter:
+        def build_continuation_step_fn(self, case, **kwargs):
+            raise RuntimeError("adapter rebuild failed")
+
+    with caplog.at_level(logging.WARNING):
+        res2 = engine.run_continuation(
+            case,
+            adapter=FailingAdapter(),
+            chat_fn=mock_chat_answer,
+        )
+
+    assert res2.teacher_success is True
+    assert any("failed to rebuild step fn on attempt 1: adapter rebuild failed" in r.message for r in caplog.records)
+
+    caplog.clear()
+
+    # 3. adapter.reset_continuation_env raises RuntimeError on attempt 2
+    class FailingResetAdapter:
+        def __init__(self):
+            self.step_called = 0
+
+        def build_continuation_step_fn(self, case, **kwargs):
+            def _step(action):
+                self.step_called += 1
+                if self.step_called == 1:
+                    return "First attempt failed", True, 0.0
+                return "Second attempt succeeded", True, 1.0
+            return _step
+
+        def reset_continuation_env(self, case, **kwargs):
+            raise RuntimeError("reset environment failed")
+
+    def mock_chat_two_steps(system, user, **kw):
+        return "<think>Act</think><action>do something</action>", {}
+
+    with caplog.at_level(logging.WARNING):
+        res3 = engine.run_continuation(
+            case,
+            adapter=FailingResetAdapter(),
+            chat_fn=mock_chat_two_steps,
+        )
+
+    # Verify no NameError was raised and reset warning logged
+    assert any("adapter.reset_continuation_env error on attempt 2: reset environment failed" in r.message for r in caplog.records)
+
+
+
+
 
 
