@@ -133,23 +133,9 @@ def run_skillpivot_reflect_step(
         w_div=w_div,
     )
 
-    # If no evaluator is explicitly supplied, check adapter or fallback to SearchQA evaluator
-    if evaluator_fn is None and adapter is not None and hasattr(adapter, "build_continuation_evaluator_fn"):
-        try:
-            adapter_eval = adapter.build_continuation_evaluator_fn(None, train_env=train_env)
-            if callable(adapter_eval):
-                evaluator_fn = adapter_eval
-        except TypeError:
-            try:
-                adapter_eval = adapter.build_continuation_evaluator_fn(None)
-                if callable(adapter_eval):
-                    evaluator_fn = adapter_eval
-            except Exception:
-                pass
-        except Exception:
-            pass
-
-    if evaluator_fn is None:
+    # Adapter evaluators are resolved per case by Pipeline, with real context.
+    # Standalone callers retain the strict SearchQA-compatible fallback.
+    if evaluator_fn is None and adapter is None:
         try:
             from skillopt.envs.searchqa.evaluator import evaluate as searchqa_eval
             from skillopt.envs.searchqa.evaluator import normalize_answer

@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable
 
+from skillopt.optimizer.skillpivot.continuation_env import call_hook
 from skillopt.optimizer.skillpivot.delta_generator import DeltaGenerator
 from skillopt.optimizer.skillpivot.regression_verifier import RegressionGatedVerifier
 from skillopt.optimizer.skillpivot.teacher_continuation import TeacherContinuationEngine
@@ -52,6 +53,7 @@ class SkillPivotPipeline:
         adapter: Any = None,
         train_env: Any = None,
         env_step_fn_builder: Callable[[int], Any] | None = None,
+        env_reset_fn: Callable[..., bool | None] | None = None,
         **kwargs,
     ) -> tuple[str, list[SkillDelta], list[RegressionGateResult]]:
         """Run one optimization iteration across a batch of failed cases.
@@ -67,221 +69,32 @@ class SkillPivotPipeline:
         sim_allowed = self.allow_simulated if allow_simulated is None else allow_simulated
 
         for case in paired_cases:
-            from skillopt.envs.base import EnvAdapter
-
-            last_reset_attempt = [0]
-
-            def _env_reset(attempt: int = 1) -> bool:
-                if attempt <= 1:
-                    return False
-                if last_reset_attempt[0] == attempt:
-                    return True
-
-                performed = False
-                reset_error = None
-
-                # 1. 尝试调用 adapter 的 reset_continuation_env（若非基类空实现）
-                if adapter is not None and hasattr(adapter, "reset_continuation_env"):
-                    is_base_noop = getattr(type(adapter), "reset_continuation_env", None) is EnvAdapter.reset_continuation_env
-                    if not is_base_noop:
-                        try:
-                            res = adapter.reset_continuation_env(case, train_env=train_env, attempt=attempt, **kwargs)
-                            if res is not False:
-                                performed = True
-                            else:
-                                reset_error = "adapter.reset_continuation_env returned False"
-                        except TypeError:
-                            try:
-                                res = adapter.reset_continuation_env(case, train_env=train_env, attempt=attempt)
-                                if res is not False:
-                                    performed = True
-                                else:
-                                    reset_error = "adapter.reset_continuation_env returned False"
-                            except TypeError:
-                                try:
-                                    res = adapter.reset_continuation_env(case, train_env=train_env)
-                                    if res is not False:
-                                        performed = True
-                                    else:
-                                        reset_error = "adapter.reset_continuation_env returned False"
-                                except TypeError:
-                                    try:
-                                        res = adapter.reset_continuation_env(case)
-                                        if res is not False:
-                                            performed = True
-                                        else:
-                                            reset_error = "adapter.reset_continuation_env returned False"
-                                    except Exception as e:
-                                        reset_error = str(e)
-                                        logger.warning(f"Task {case.task_id}: adapter.reset_continuation_env error on attempt {attempt}: {e}")
-                                        raise
-                            except Exception as e:
-                                reset_error = str(e)
-                                logger.warning(f"Task {case.task_id}: adapter.reset_continuation_env error on attempt {attempt}: {e}")
-                                raise
-                        except Exception as e:
-                            reset_error = str(e)
-                            logger.warning(f"Task {case.task_id}: adapter.reset_continuation_env error on attempt {attempt}: {e}")
-                            raise
-
-                # 2. 若 adapter 未重置，尝试调用 env_step_fn 绑定的 reset
-                if not performed and callable(env_step_fn):
-                    target_reset = None
-                    if hasattr(env_step_fn, "reset") and callable(env_step_fn.reset):
-                        target_reset = env_step_fn.reset
-                    elif hasattr(getattr(env_step_fn, "__self__", None), "reset") and callable(getattr(env_step_fn, "__self__").reset):
-                        target_reset = getattr(env_step_fn, "__self__").reset
-
-                    if target_reset is not None:
-                        try:
-                            res = target_reset(attempt)
-                            if res is not False:
-                                performed = True
-                            else:
-                                reset_error = "bound reset returned False"
-                        except TypeError:
-                            try:
-                                res = target_reset()
-                                if res is not False:
-                                    performed = True
-                                else:
-                                    reset_error = "bound reset returned False"
-                            except Exception as e:
-                                reset_error = str(e)
-                                logger.warning(f"Task {case.task_id}: env_step_fn bound reset error on attempt {attempt}: {e}")
-                                raise
-                        except Exception as e:
-                            reset_error = str(e)
-                            logger.warning(f"Task {case.task_id}: env_step_fn bound reset error on attempt {attempt}: {e}")
-                            raise
-
-                if performed:
-                    last_reset_attempt[0] = attempt
-                    return True
-                if reset_error:
-                    raise RuntimeError(f"Reset failed on attempt {attempt}: {reset_error}")
-                return False
-
-            def _step_fn_builder(attempt: int = 1):
-                explicit_builder = env_step_fn_builder or kwargs.get("env_step_fn_builder")
-                if explicit_builder is not None:
-                    return explicit_builder(attempt)
-
-                # 检查 env_step_fn 是否为可调用的构造工厂函数
-                is_factory = False
-                factory_call_args = None
-                if callable(env_step_fn):
-                    try:
-                        import inspect
-                        sig = inspect.signature(env_step_fn)
-                        params = list(sig.parameters.keys())
-                        if len(params) >= 2 and params[0] in ("case", "task_case", "paired_case") and params[1] in ("attempt", "retry"):
-                            is_factory = True
-                            factory_call_args = (case, attempt)
-                        elif len(params) >= 1 and params[0] in ("case", "task_case", "paired_case"):
-                            is_factory = True
-                            factory_call_args = (case,)
-                        elif len(params) >= 1 and params[0] in ("attempt", "retry"):
-                            is_factory = True
-                            factory_call_args = (attempt,)
-                    except (ValueError, TypeError):
-                        is_factory = False
-
-                if is_factory:
-                    # 工厂函数抛出的业务异常直接向外抛出供引擎门控捕获，严禁 fallback 返回工厂本身
-                    return env_step_fn(*factory_call_args)
-
-                # 保留显式 step 的优先级，避免 adapter 默认 hook 遮蔽真实 step 执行
-                if callable(env_step_fn):
-                    if attempt > 1:
-                        # 对于纯复用同一固定 env_step_fn 的状态化环境（既无独立 builder 亦非工厂），重试前若存在 reset 机制则必须成功重置
-                        # 若重置抛出异常或返回 False，将抛出 RuntimeError 触发构造/重置门控拦截，严禁沿用被污染环境
-                        has_reset_mechanism = False
-                        if adapter is not None and hasattr(adapter, "reset_continuation_env"):
-                            if getattr(type(adapter), "reset_continuation_env", None) is not EnvAdapter.reset_continuation_env:
-                                has_reset_mechanism = True
-                        if (hasattr(env_step_fn, "reset") and callable(env_step_fn.reset)) or \
-                           (hasattr(getattr(env_step_fn, "__self__", None), "reset") and callable(getattr(env_step_fn, "__self__").reset)):
-                            has_reset_mechanism = True
-
-                        if has_reset_mechanism:
-                            reset_res = _env_reset(attempt)
-                            if not reset_res:
-                                raise RuntimeError(f"Environment reset failed on attempt {attempt}")
-                    return env_step_fn
-
-                # 未显式提供 env_step_fn 时，由 adapter.build_continuation_step_fn 构建
-                if adapter is not None and hasattr(adapter, "build_continuation_step_fn"):
-                    try:
-                        step_cand = adapter.build_continuation_step_fn(
-                            case,
-                            train_env=train_env,
-                            attempt=attempt,
-                            **kwargs,
-                        )
-                        if step_cand is not None:
-                            return step_cand
-                    except TypeError:
-                        try:
-                            step_cand = adapter.build_continuation_step_fn(case, train_env=train_env)
-                            if step_cand is not None:
-                                return step_cand
-                        except TypeError:
-                            step_cand = adapter.build_continuation_step_fn(case)
-                            if step_cand is not None:
-                                return step_cand
-                    # 保留真实环境构造异常向外抛出，供 TeacherContinuationEngine 捕获并记录失败，严禁吞掉降级为纯答案验证
-
-                return None
-
-            # Resolve task-specific evaluator function
             case_evaluator_fn = evaluator_fn
-            if adapter is not None and hasattr(adapter, "build_continuation_evaluator_fn"):
-                try:
-                    adapter_eval = adapter.build_continuation_evaluator_fn(
-                        case,
-                        train_env=train_env,
-                        **kwargs,
-                    )
-                    if adapter_eval is not None:
-                        case_evaluator_fn = adapter_eval
-                except TypeError:
+            # Explicit evaluators retain priority over optional adapter hooks.
+            if case_evaluator_fn is None:
+                hook = getattr(adapter, "build_continuation_evaluator_fn", None)
+                if hook is not None:
                     try:
-                        adapter_eval = adapter.build_continuation_evaluator_fn(case)
-                        if adapter_eval is not None:
-                            case_evaluator_fn = adapter_eval
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
+                        case_evaluator_fn = call_hook(
+                            hook, case, **{**kwargs, "train_env": train_env},
+                        )
+                        if case_evaluator_fn is not None and not callable(case_evaluator_fn):
+                            raise TypeError("adapter evaluator must be callable or None")
+                    except Exception as exc:
+                        logger.warning("Task %s: failed to build evaluator: %s", case.task_id, exc)
+                        case.teacher_success = False
+                        case.extras["continuation_evaluator_error"] = str(exc)
+                        continue
 
-            # 仅在实际存在可用 reset 实现时向引擎传递 reset 回调
-            has_adapter_reset = (
-                adapter is not None
-                and hasattr(adapter, "reset_continuation_env")
-                and getattr(type(adapter), "reset_continuation_env", None) is not EnvAdapter.reset_continuation_env
-            )
-            has_step_reset = (
-                callable(env_step_fn)
-                and (
-                    (hasattr(env_step_fn, "reset") and callable(env_step_fn.reset))
-                    or (hasattr(getattr(env_step_fn, "__self__", None), "reset") and callable(getattr(env_step_fn, "__self__").reset))
-                )
-            )
-            effective_env_reset_fn = _env_reset if (has_adapter_reset or has_step_reset) else None
-
-            # Stage 3: Teacher Continuation (if not already simulated/run)
             if not case.teacher_success or not case.teacher_suffix:
-                initial_step_fn = env_step_fn if callable(env_step_fn) else None
                 case = self.teacher_engine.run_continuation(
-                    case,
-                    env_step_fn=initial_step_fn,
+                    case, env_step_fn=env_step_fn,
                     evaluator_fn=case_evaluator_fn,
                     allow_simulated=sim_allowed,
-                    adapter=adapter,
-                    train_env=train_env,
-                    env_step_fn_builder=_step_fn_builder,
-                    env_reset_fn=effective_env_reset_fn,
+                    adapter=adapter, train_env=train_env,
+                    env_step_fn_builder=env_step_fn_builder,
+                    env_reset_fn=env_reset_fn,
+                    adapter_kwargs=kwargs,
                 )
 
             if not case.teacher_success:

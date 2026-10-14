@@ -16,6 +16,10 @@ import re
 from typing import Any, Callable
 
 from skillopt.model import chat_optimizer
+from skillopt.optimizer.skillpivot.continuation_env import (
+    ContinuationRuntime,
+    ContinuationSetupError,
+)
 from skillopt.types import PairedSuffixCase, TrajectoryStep
 
 logger = logging.getLogger(__name__)
@@ -48,76 +52,6 @@ def extract_final_answer(text: str) -> str:
     if m_fin:
         return m_fin.group(1).strip()
     return ""
-
-
-def _collect_env_identities(step_fn: Any) -> list[Any]:
-    """Collect candidate underlying environment instances, callables, and states from step_fn.
-
-    Traverses bound instances (__self__), explicit environment attributes (env, environment),
-    and closure cells capturing outer stateful contexts (e.g. adapter or environment instances).
-    Filters out primitive types, types/classes, and modules to avoid false-positive collisions.
-    Uses identity checks (is) exclusively, requiring no __hash__ or __eq__ implementation.
-    """
-    import types
-
-    identities: list[Any] = []
-    if step_fn is None:
-        return identities
-
-    def _append(obj: Any):
-        if (
-            obj is not None
-            and not isinstance(
-                obj,
-                (
-                    int,
-                    float,
-                    str,
-                    bool,
-                    bytes,
-                    type(None),
-                    type,
-                    types.ModuleType,
-                ),
-            )
-            and not any(obj is item for item in identities)
-        ):
-            identities.append(obj)
-
-    # 1. Callable itself
-    _append(step_fn)
-
-    # 2. Bound method instance (__self__)
-    bound_self = getattr(step_fn, "__self__", None)
-    if bound_self is not None:
-        _append(bound_self)
-
-    # 3. Explicit environment attribute references
-    for attr in ("env", "environment", "underlying_env", "target_env", "context"):
-        val = getattr(step_fn, attr, None)
-        if val is not None:
-            _append(val)
-        if bound_self is not None:
-            val2 = getattr(bound_self, attr, None)
-            if val2 is not None:
-                _append(val2)
-
-    # 4. Inspect closure cells for stateful outer context instances
-    closure = getattr(step_fn, "__closure__", None)
-    if closure:
-        for cell in closure:
-            try:
-                cell_content = cell.cell_contents
-            except (ValueError, AttributeError):
-                continue
-            _append(cell_content)
-            if cell_content is not None:
-                for attr in ("env", "environment", "underlying_env", "target_env"):
-                    nested_env = getattr(cell_content, attr, None)
-                    if nested_env is not None:
-                        _append(nested_env)
-
-    return identities
 
 
 def default_verify_answer(pred_answer: str, ground_truth: Any) -> bool:
@@ -281,7 +215,8 @@ class TeacherContinuationEngine:
         adapter: Any = None,
         train_env: Any = None,
         env_step_fn_builder: Callable[[int], Callable[[str], tuple[str, bool, float]] | None] | None = None,
-        env_reset_fn: Callable[..., None] | None = None,
+        env_reset_fn: Callable[..., bool | None] | None = None,
+        adapter_kwargs: dict[str, Any] | None = None,
     ) -> PairedSuffixCase:
         """Execute teacher continuation from t* for up to max_steps turns.
 
@@ -311,236 +246,25 @@ class TeacherContinuationEngine:
 
         t_star = case.deviation.step_index if case.deviation else len(case.prefix_steps) + 1
 
-        polluted_env_refs: list[Any] = []
-        polluted_state_ids: set[Any] = set()
+        runtime = ContinuationRuntime(
+            case, step_fn=env_step_fn, builder=env_step_fn_builder,
+            reset_fn=env_reset_fn, adapter=adapter, train_env=train_env,
+            context=adapter_kwargs,
+        )
         last_executed_teacher_steps: list[TrajectoryStep] = []
-
-        def _discard_identities(targets: list[Any]):
-            nonlocal polluted_env_refs
-            polluted_env_refs = [ref for ref in polluted_env_refs if not any(ref is t for t in targets)]
-            for t in targets:
-                for attr in ("env_id", "state_id", "checkpoint_id"):
-                    val = getattr(t, attr, None)
-                    if val is not None:
-                        polluted_state_ids.discard(val)
 
         for attempt in range(1, self.max_retries + 1):
             teacher_steps: list[TrajectoryStep] = []
             conversation_history = base_user_prompt
             success = False
-
-            # Reset tracking for stateful environments across retries
-            did_reset = False
-            reset_failed = False
-            reset_error_message = ""
-
-            if attempt > 1:
-                # 1. Custom env_reset_fn
-                if env_reset_fn is not None:
-                    try:
-                        res = env_reset_fn(attempt)
-                        if res is not False:
-                            did_reset = True
-                        else:
-                            reset_failed = True
-                            reset_error_message = "env_reset_fn returned False"
-                    except TypeError:
-                        try:
-                            res = env_reset_fn()
-                            if res is not False:
-                                did_reset = True
-                            else:
-                                reset_failed = True
-                                reset_error_message = "env_reset_fn returned False"
-                        except Exception as e:
-                            reset_failed = True
-                            reset_error_message = str(e)
-                            logger.warning(f"Task {case.task_id}: env_reset_fn error on attempt {attempt}: {e}")
-                    except Exception as e:
-                        reset_failed = True
-                        reset_error_message = str(e)
-                        logger.warning(f"Task {case.task_id}: env_reset_fn error on attempt {attempt}: {e}")
-
-                # 2. Adapter reset_continuation_env hook
-                if not did_reset and not reset_failed and adapter is not None and hasattr(adapter, "reset_continuation_env"):
-                    from skillopt.envs.base import EnvAdapter
-                    is_base_noop = getattr(type(adapter), "reset_continuation_env", None) is EnvAdapter.reset_continuation_env
-                    if not is_base_noop:
-                        try:
-                            res = adapter.reset_continuation_env(case, train_env=train_env, attempt=attempt)
-                            if res is not False:
-                                did_reset = True
-                            else:
-                                reset_failed = True
-                                reset_error_message = "adapter.reset_continuation_env returned False"
-                        except TypeError:
-                            try:
-                                res = adapter.reset_continuation_env(case, train_env=train_env)
-                                if res is not False:
-                                    did_reset = True
-                                else:
-                                    reset_failed = True
-                                    reset_error_message = "adapter.reset_continuation_env returned False"
-                            except TypeError:
-                                try:
-                                    res = adapter.reset_continuation_env(case)
-                                    if res is not False:
-                                        did_reset = True
-                                    else:
-                                        reset_failed = True
-                                        reset_error_message = "adapter.reset_continuation_env returned False"
-                                except Exception as e:
-                                    reset_failed = True
-                                    reset_error_message = str(e)
-                                    logger.warning(f"Task {case.task_id}: adapter.reset_continuation_env error on attempt {attempt}: {e}")
-                            except Exception as e:
-                                reset_failed = True
-                                reset_error_message = str(e)
-                                logger.warning(f"Task {case.task_id}: adapter.reset_continuation_env error on attempt {attempt}: {e}")
-                        except Exception as e:
-                            reset_failed = True
-                            reset_error_message = str(e)
-                            logger.warning(f"Task {case.task_id}: adapter.reset_continuation_env error on attempt {attempt}: {e}")
-
-                if did_reset:
-                    polluted_env_refs.clear()
-                    polluted_state_ids.clear()
-
-            # Resolve / rebuild environment step function for this attempt
-            active_env_step_fn = None
-            env_construction_failed = False
-            env_error_message = ""
-
-            if env_step_fn_builder is not None:
-                try:
-                    active_env_step_fn = env_step_fn_builder(attempt)
-                except Exception as e:
-                    logger.warning(f"Task {case.task_id}: env_step_fn_builder error on attempt {attempt}: {e}")
-                    active_env_step_fn = None
-                    env_construction_failed = True
-                    env_error_message = str(e)
-            elif env_step_fn is not None:
-                # 保留显式 step 优先级，避免 adapter 默认 hook 遮蔽真实 step 执行
-                active_env_step_fn = env_step_fn
-            elif adapter is not None and hasattr(adapter, "build_continuation_step_fn"):
-                try:
-                    active_env_step_fn = adapter.build_continuation_step_fn(
-                        case,
-                        train_env=train_env,
-                        attempt=attempt,
-                    )
-                except TypeError:
-                    try:
-                        active_env_step_fn = adapter.build_continuation_step_fn(case, train_env=train_env)
-                    except TypeError:
-                        active_env_step_fn = adapter.build_continuation_step_fn(case)
-                except Exception as e:
-                    logger.warning(f"Task {case.task_id}: failed to rebuild step fn on attempt {attempt}: {e}")
-                    active_env_step_fn = None
-                    env_construction_failed = True
-                    env_error_message = str(e)
-
-            current_env_instance = getattr(active_env_step_fn, "__self__", None) if active_env_step_fn is not None else None
-
-            # 3. In-situ reset on active step function if not already reset
-            if attempt > 1 and not did_reset and active_env_step_fn is not None:
-                reset_fn = None
-                if hasattr(active_env_step_fn, "reset") and callable(active_env_step_fn.reset):
-                    reset_fn = active_env_step_fn.reset
-                elif hasattr(getattr(active_env_step_fn, "__self__", None), "reset") and callable(getattr(active_env_step_fn, "__self__").reset):
-                    reset_fn = getattr(active_env_step_fn, "__self__").reset
-
-                if reset_fn is not None:
-                    try:
-                        res = reset_fn(attempt)
-                        if res is not False:
-                            did_reset = True
-                            if active_env_step_fn is not None:
-                                _discard_identities(_collect_env_identities(active_env_step_fn))
-                        else:
-                            reset_failed = True
-                            reset_error_message = "active_env_step_fn reset returned False"
-                    except TypeError:
-                        try:
-                            res = reset_fn()
-                            if res is not False:
-                                did_reset = True
-                                if active_env_step_fn is not None:
-                                    _discard_identities(_collect_env_identities(active_env_step_fn))
-                            else:
-                                reset_failed = True
-                                reset_error_message = "active_env_step_fn reset returned False"
-                        except Exception as e:
-                            reset_failed = True
-                            reset_error_message = str(e)
-                            logger.warning(f"Task {case.task_id}: active_env_step_fn reset error on attempt {attempt}: {e}")
-                    except Exception as e:
-                        reset_failed = True
-                        reset_error_message = str(e)
-                        logger.warning(f"Task {case.task_id}: active_env_step_fn reset error on attempt {attempt}: {e}")
-
-            # ── Attempt 状态门控 1: 环境构造失败门控 ──
-            if env_construction_failed:
-                obs = f"Environment construction failed: {env_error_message}"
-                step_record = TrajectoryStep(
-                    step=t_star,
-                    action="ENVIRONMENT_ERROR",
-                    observation=obs,
-                    reasoning="",
-                    raw_model_response="",
-                    reward=0.0,
-                    done=True,
-                    execution_status=0,
-                )
-                teacher_steps.append(step_record)
+            try:
+                active_env_step_fn = runtime.prepare(attempt)
+            except ContinuationSetupError as exc:
+                teacher_steps.append(TrajectoryStep(
+                    step=t_star, action=exc.action, observation=str(exc),
+                    reward=0.0, done=True, execution_status=0,
+                ))
                 continue
-
-            # ── Attempt 状态门控 2: 环境重置失败 / 污染状态复用门控 ──
-            if attempt > 1:
-                is_current_env_polluted = False
-                if active_env_step_fn is not None:
-                    # 检查是否有显式声明的 clean/restored 恢复契约
-                    is_contract_clean = False
-                    for attr in ("is_clean_env", "checkpoint_restored", "is_fresh"):
-                        if getattr(active_env_step_fn, attr, False) is True:
-                            is_contract_clean = True
-                            break
-                        if current_env_instance is not None and getattr(current_env_instance, attr, False) is True:
-                            is_contract_clean = True
-                            break
-
-                    if not is_contract_clean:
-                        current_identities = _collect_env_identities(active_env_step_fn)
-                        for identity in current_identities:
-                            # 1. 对象身份比对 (Identity check via 'is' - 绝不依赖 __hash__ 或 __eq__)
-                            if any(identity is ref for ref in polluted_env_refs):
-                                is_current_env_polluted = True
-                                break
-                            # 2. 状态标识符比对 (env_id / state_id / checkpoint_id)
-                            for attr in ("env_id", "state_id", "checkpoint_id"):
-                                val = getattr(identity, attr, None)
-                                if val is not None and val in polluted_state_ids:
-                                    is_current_env_polluted = True
-                                    break
-                            if is_current_env_polluted:
-                                break
-
-                # 若当前环境属于已被历史动作污染的环境，且未成功 reset（或 reset 失败），则拒绝继续该 attempt
-                if is_current_env_polluted and (not did_reset or reset_failed):
-                    err_msg = reset_error_message or "stateful environment not reset from previous attempt"
-                    obs = f"Environment reset failed: {err_msg}"
-                    step_record = TrajectoryStep(
-                        step=t_star,
-                        action="RESET_ERROR",
-                        observation=obs,
-                        reasoning="",
-                        raw_model_response="",
-                        reward=0.0,
-                        done=True,
-                        execution_status=0,
-                    )
-                    teacher_steps.append(step_record)
-                    continue
 
             attempt_executed_steps = False
             for step_offset in range(self.max_steps):
@@ -569,6 +293,7 @@ class TeacherContinuationEngine:
                 execution_failed = False
 
                 if active_env_step_fn is not None:
+                    runtime.mark_used()
                     try:
                         obs, done, reward = active_env_step_fn(action)
                         exec_st = 0 if "error" in obs.lower() or not obs.strip() else 1
@@ -676,15 +401,6 @@ class TeacherContinuationEngine:
                 )
 
             if attempt_executed_steps:
-                if active_env_step_fn is not None:
-                    executed_identities = _collect_env_identities(active_env_step_fn)
-                    for item in executed_identities:
-                        if not any(item is ref for ref in polluted_env_refs):
-                            polluted_env_refs.append(item)
-                        for attr in ("env_id", "state_id", "checkpoint_id"):
-                            val = getattr(item, attr, None)
-                            if val is not None:
-                                polluted_state_ids.add(val)
                 last_executed_teacher_steps = list(teacher_steps)
 
             if success:

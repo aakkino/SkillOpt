@@ -29,7 +29,10 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 import os
 import random
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
+
+if TYPE_CHECKING:
+    from skillopt.optimizer.skillpivot.continuation_env import ContinuationEnvironment
 
 from skillopt.datasets.base import BaseDataLoader, BatchSpec
 from skillopt.prompts import load_prompt
@@ -337,12 +340,18 @@ class EnvAdapter(ABC):
         train_env: Any = None,
         attempt: int = 1,
         **kwargs,
-    ) -> Callable[[str], tuple[str, bool, float]] | None:
+    ) -> Callable[[str], tuple[str, bool, float]] | ContinuationEnvironment | None:
         """Build an environment step function for teacher continuation from deviation point t*.
 
         For interactive environments that maintain or can reconstruct simulation state
         (e.g., by replaying prefix_steps, restoring checkpoint, or slicing from train_env),
         override this method to return a callable: action -> (observation: str, is_done: bool, reward: float).
+
+        For wrapped callbacks or opaque state, return ContinuationEnvironment
+        with the actual state object and an optional reset_fn. Set restored=True
+        only after restoring the shared prefix for this build; return a new
+        handle for each restoration. Logs/configuration are not task state.
+        See docs/reference/skillpivot-continuation.md for the full contract.
 
         Args:
             case: PairedSuffixCase containing prefix steps and task information.
@@ -361,10 +370,12 @@ class EnvAdapter(ABC):
         train_env: Any = None,
         attempt: int = 1,
         **kwargs,
-    ) -> None:
+    ) -> bool | None:
         """Reset or rollback environment state for a new teacher continuation attempt.
 
         Override in stateful environments if in-place reset is preferred over rebuilding step_fn.
+        Return False or raise when restoration fails. None/True indicates that
+        the current case's state has been restored to its shared prefix.
         """
         pass
 
