@@ -113,4 +113,57 @@ def test_run_skillpivot_reflect_step_with_mocked_pipeline(tmp_path, monkeypatch)
     edit = inner_patch["edits"][0]
     assert edit["op"] == "append"
     assert edit["target"] == "Fallback Guidelines"
+    assert "### Procedural Update [improve_skill]: Fallback Guidelines" in edit["content"]
+    assert "> Applicable Condition: 404 error" in edit["content"]
     assert "On 404, fallback to synonyms." in edit["content"]
+
+    # Test applying patch to verify full retention of conditions (P1 fix)
+    from skillopt.optimizer.skill import apply_patch_with_report
+    base_skill = "# Search Skill\nAlways verify keywords."
+    updated_skill, _ = apply_patch_with_report(base_skill, inner_patch)
+    assert "> Applicable Condition: 404 error" in updated_skill
+    assert "### Procedural Update [improve_skill]: Fallback Guidelines" in updated_skill
+    assert "On 404, fallback to synonyms." in updated_skill
+
+
+def test_condition_preservation_and_text_consistency():
+    """Verify that gate review tentative text matches final apply_patch text exactly (P1 fix)."""
+    from skillopt.optimizer.skill import apply_patch_with_report
+    from skillopt.optimizer.skillpivot.delta_generator import DeltaGenerator
+    from skillopt.types import SkillDelta
+
+    delta = SkillDelta(
+        action="improve_skill",
+        skill_name="test_skill",
+        target_rule="Retry Logic",
+        content="Retry the operation.",
+        trigger_condition="Only when the operation is idempotent",
+        rationale="Prevent unsafe duplicate writes",
+    )
+
+    orig_skill = "# Base Skill\n1. Check inputs carefully."
+
+    # 1. Pipeline gate tentative skill text
+    tentative_skill = DeltaGenerator.apply_delta(orig_skill, delta)
+    assert "Applicable Condition: Only when the operation is idempotent" in tentative_skill
+    assert "### Procedural Update [improve_skill]: Retry Logic" in tentative_skill
+    assert "Retry the operation." in tentative_skill
+
+    # 2. Downstream trainer patch construction & apply_patch execution
+    patch_def = {
+        "reasoning": f"SkillPivot [{delta.action}] rule={delta.target_rule}: {delta.rationale}",
+        "edits": [
+            {
+                "op": "append",
+                "content": delta.render_content(),
+                "target": delta.target_rule,
+            }
+        ],
+    }
+
+    applied_skill, _ = apply_patch_with_report(orig_skill, patch_def)
+
+    # 3. Text consistency check: both paths produce byte/content-identical skill extensions
+    assert applied_skill.strip() == tentative_skill.strip()
+    assert "Applicable Condition: Only when the operation is idempotent" in applied_skill
+

@@ -172,13 +172,20 @@ class DeltaGenerator:
         )
 
     @staticmethod
+    def render_delta_content(delta: SkillDelta) -> str:
+        """Render candidate SkillDelta to textual representation preserving procedural update header,
+        applicable condition, and rule content."""
+        rule_suffix = f": {delta.target_rule.strip()}" if delta.target_rule.strip() else ""
+        header = f"### Procedural Update [{delta.action}]{rule_suffix}\n"
+        if delta.trigger_condition.strip():
+            header += f"> Applicable Condition: {delta.trigger_condition.strip()}\n\n"
+        return (header + delta.content.strip()).strip()
+
+    @staticmethod
     def apply_delta(original_skill: str, delta: SkillDelta) -> str:
         """Apply candidate SkillDelta to original skill to produce tentative skill s'."""
         if delta.action == "skip" or not delta.content.strip():
             return original_skill
 
-        header = f"\n\n### Procedural Update [{delta.action}]: {delta.target_rule}\n"
-        if delta.trigger_condition.strip():
-            header += f"> Applicable Condition: {delta.trigger_condition.strip()}\n\n"
-
-        return original_skill.strip() + header + delta.content.strip() + "\n"
+        rendered = DeltaGenerator.render_delta_content(delta)
+        return original_skill.rstrip() + "\n\n" + rendered + "\n"

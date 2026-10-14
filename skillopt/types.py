@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from dataclasses import fields as dc_fields
+import re
 from typing import Any, Literal
 
 from skillopt.datasets.base import BatchSpec  # noqa: F401
@@ -325,6 +326,22 @@ class TrajectoryStep:
     done: bool = False
     execution_status: int = 1  # 1: success/usable, 0: syntax error/exception/empty (Exec_t)
 
+    @staticmethod
+    def is_system_or_eval(d: dict) -> bool:
+        """Check whether a conversation record is system metadata or evaluation report."""
+        if not isinstance(d, dict):
+            return False
+        role = str(d.get("role", "")).lower()
+        if role in {"system", "evaluator"}:
+            return True
+        msg_type = str(d.get("type", "")).lower()
+        if msg_type in {"system", "eval", "evaluation", "eval_result"}:
+            return True
+        content = str(d.get("content", ""))
+        if "[EVALUATION RESULT]" in content or content.strip().startswith("Exact Match:"):
+            return True
+        return False
+
     @classmethod
     def from_dict(cls, d: dict, default_step: int = 0) -> TrajectoryStep:
         # Tool-call record: {"type": "tool_call", "cmd": ..., "obs": ...}
@@ -339,6 +356,43 @@ class TrajectoryStep:
                 reasoning=str(d.get("reasoning") or ""),
                 execution_status=is_valid,
                 done=bool(d.get("done", False)),
+            )
+
+        # Message record (e.g. SearchQA: {"type": "message", "turn": 1, "content": ...})
+        if d.get("type") == "message" or ("content" in d and "action" not in d):
+            content = str(d.get("content") or "")
+            # Extract reasoning (<think>...</think>)
+            think_match = re.search(r"<think>(.*?)</think>", content, re.DOTALL | re.IGNORECASE)
+            reasoning = think_match.group(1).strip() if think_match else ""
+
+            # Extract action / answer
+            action_match = re.search(r"<action>(.*?)</action>", content, re.DOTALL | re.IGNORECASE)
+            answer_match = re.search(r"<answer>(.*?)</answer>", content, re.DOTALL | re.IGNORECASE)
+
+            if action_match:
+                action = action_match.group(1).strip()
+            elif answer_match:
+                action = f"<answer>{answer_match.group(1).strip()}</answer>"
+            else:
+                clean_content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL | re.IGNORECASE).strip()
+                action = clean_content if clean_content else content.strip()
+
+            obs = str(d.get("env_feedback") or d.get("observation") or d.get("obs") or "")
+            if not obs and answer_match:
+                obs = "(final answer generated)"
+
+            step_idx = int(d.get("step") or d.get("turn") or default_step)
+            is_valid = 1 if action and "error" not in action.lower() else 0
+
+            return cls(
+                step=step_idx,
+                action=action,
+                observation=obs,
+                reasoning=reasoning,
+                raw_model_response=content,
+                reward=float(d.get("reward", 0.0)),
+                done=bool(d.get("done", bool(answer_match))),
+                execution_status=is_valid,
             )
 
         # Standard Step record: {"step": N, "action": ..., "env_feedback": ...}
@@ -505,6 +559,15 @@ class SkillDelta:
     trigger_condition: str = ""
     rationale: str = ""
     source_case_id: str = ""
+
+    def render_content(self) -> str:
+        """Render candidate SkillDelta to textual representation preserving procedural update header,
+        applicable condition, and rule content."""
+        rule_suffix = f": {self.target_rule.strip()}" if self.target_rule.strip() else ""
+        header = f"### Procedural Update [{self.action}]{rule_suffix}\n"
+        if self.trigger_condition.strip():
+            header += f"> Applicable Condition: {self.trigger_condition.strip()}\n\n"
+        return (header + self.content.strip()).strip()
 
     def to_dict(self) -> dict[str, Any]:
         return {

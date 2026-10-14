@@ -95,8 +95,11 @@ def run_skillpivot_reflect_step(
     prediction_dir: str,
     cfg: dict,
     env_step_fn: Any = None,
+    evaluator_fn: Any = None,
     embedding_provider: Any = None,
     pipeline: Any = None,
+    adapter: Any = None,
+    allow_simulated: bool = False,
 ) -> list[dict]:
     """Execute SkillPivot fine-grained deviation detection, teacher continuation,
     paired suffix contrast, and regression gating.
@@ -129,6 +132,25 @@ def run_skillpivot_reflect_step(
         w_div=w_div,
     )
 
+    # If no evaluator is explicitly supplied, configure SearchQA evaluator if applicable
+    if evaluator_fn is None:
+        try:
+            from skillopt.envs.searchqa.evaluator import evaluate as searchqa_eval
+
+            def _searchqa_evaluator(pred_ans: str, gold_answers: Any) -> bool:
+                if isinstance(gold_answers, str):
+                    gold_list = [gold_answers]
+                elif isinstance(gold_answers, (list, tuple, set)):
+                    gold_list = [str(x) for x in gold_answers]
+                else:
+                    gold_list = [str(gold_answers)]
+                res = searchqa_eval(pred_ans, gold_list)
+                return bool(res.get("em", 0.0) >= 1.0 or res.get("sub_em", 0.0) >= 1.0)
+
+            evaluator_fn = _searchqa_evaluator
+        except ImportError:
+            evaluator_fn = None
+
     # 1. Slice failed trajectories into PairedSuffixCase objects
     paired_cases = []
     for item in failures:
@@ -144,16 +166,21 @@ def run_skillpivot_reflect_step(
         if not conv:
             continue
 
-        gt = str(item.get("reference_text") or item.get("ground_truth") or "")
+        gt = item.get("reference_text") or item.get("ground_truth") or item.get("gold_answers") or ""
+        gt_str = str(gt[0]) if isinstance(gt, (list, tuple)) and gt else str(gt)
+
         case = detector.slice_trajectory(
             task_id=tid,
             conversation=conv,
-            ground_truth=gt,
+            ground_truth=gt_str,
             task_type=str(item.get("task_type") or item.get("instruction_type") or ""),
             task_description=str(item.get("task_description") or item.get("instruction") or item.get("question") or ""),
             skill_name="active_skill",
             skill_content=current_skill,
         )
+        # Store full gold target if list
+        if isinstance(gt, (list, tuple)):
+            case.extras["gold_answers"] = list(gt)
         paired_cases.append(case)
 
     if not paired_cases:
@@ -161,23 +188,29 @@ def run_skillpivot_reflect_step(
 
     # 2. Run SkillPivot Pipeline (Teacher Continuation -> Contrast -> Verifier Gate)
     if pipeline is None:
-        pipeline = SkillPivotPipeline(gate_threshold=gate_thresh)
+        pipeline = SkillPivotPipeline(
+            gate_threshold=gate_thresh,
+            allow_simulated=allow_simulated,
+        )
     _, accepted_deltas, gate_results = pipeline.optimize_step(
         paired_cases=paired_cases,
         current_skill=current_skill,
         env_step_fn=env_step_fn,
+        evaluator_fn=evaluator_fn,
+        allow_simulated=allow_simulated,
     )
 
     # 3. Convert accepted deltas to raw_patches compatible with trainer downstream
     raw_patches = []
     for delta in accepted_deltas:
+        rendered_content = delta.render_content()
         raw_patch = {
             "patch": {
                 "reasoning": f"SkillPivot [{delta.action}] rule={delta.target_rule}: {delta.rationale}",
                 "edits": [
                     {
                         "op": "append",
-                        "content": delta.content,
+                        "content": rendered_content,
                         "target": delta.target_rule,
                         "source_type": "failure",
                     }
@@ -1390,6 +1423,7 @@ class ReflACTTrainer:
                             current_skill=current_skill,
                             prediction_dir=pred_dir,
                             cfg=cfg,
+                            adapter=adapter,
                         )
                     else:
                         raw_patches = adapter.reflect(

@@ -85,13 +85,24 @@ class APIEmbeddingProvider(BaseEmbeddingProvider):
 class LocalMiniLMProvider(BaseEmbeddingProvider):
     """Local SentenceTransformer provider (all-MiniLM-L6-v2)."""
 
-    def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
-        self.model_name = model_name
+    def __init__(
+        self,
+        model_name: str | None = None,
+        model: str | None = None,
+        **kwargs: Any,
+    ):
+        self.model_name = model or model_name or "sentence-transformers/all-MiniLM-L6-v2"
         self._model = None
 
     def _load(self):
         if self._model is None:
-            from sentence_transformers import SentenceTransformer
+            try:
+                from sentence_transformers import SentenceTransformer
+            except ImportError as err:
+                raise ImportError(
+                    "The 'sentence-transformers' package is required for the local embedding backend. "
+                    "Please install it or configure 'api' embedding backend."
+                ) from err
 
             self._model = SentenceTransformer(self.model_name)
 
@@ -111,17 +122,33 @@ class LocalMiniLMProvider(BaseEmbeddingProvider):
 
 def get_embedding_provider(
     backend: str | None = None,
+    model: str | None = None,
     **kwargs: Any,
 ) -> BaseEmbeddingProvider:
-    """Factory helper to get the requested or default embedding provider."""
+    """Factory helper to get the requested or default embedding provider.
+
+    Unified parameter handling:
+      - 'backend': 'local' (SentenceTransformer) or 'api'/'openai'/'remote'
+      - 'model': maps cleanly to both LocalMiniLMProvider and APIEmbeddingProvider
+    """
     chosen = (backend or os.environ.get("EMBEDDING_BACKEND", "local")).lower().strip()
+    model_name = model or kwargs.pop("model_name", None)
+
     if chosen in {"api", "openai", "remote"}:
-        return APIEmbeddingProvider(**kwargs)
-    try:
-        return LocalMiniLMProvider(**kwargs)
-    except Exception:
-        # Fall back to API provider if local dependencies fail to initialize
-        return APIEmbeddingProvider(**kwargs)
+        return APIEmbeddingProvider(model=model_name, **kwargs)
+
+    if chosen in {"local", "minilm", "sentence_transformers"}:
+        return LocalMiniLMProvider(model=model_name, **kwargs)
+
+    if chosen in {"auto"}:
+        try:
+            return LocalMiniLMProvider(model=model_name, **kwargs)
+        except ImportError:
+            return APIEmbeddingProvider(model=model_name, **kwargs)
+
+    raise ValueError(
+        f"Unsupported embedding backend '{chosen}'. Expected 'local', 'api', or 'auto'."
+    )
 
 
 # ── Deviation Point Detector Core ────────────────────────────────────────
@@ -308,10 +335,17 @@ class DeviationDetector:
         skill_name: str = "",
         skill_content: str = "",
     ) -> PairedSuffixCase:
-        """Parse raw conversation dicts, detect deviation point, and return paired slice case."""
+        # Filter out system and evaluation records (e.g., SearchQA eval summary)
+        valid_records = [
+            raw for raw in conversation
+            if isinstance(raw, dict) and not TrajectoryStep.is_system_or_eval(raw)
+        ]
+        if not valid_records:
+            valid_records = conversation
+
         steps = [
             TrajectoryStep.from_dict(raw, default_step=idx + 1)
-            for idx, raw in enumerate(conversation)
+            for idx, raw in enumerate(valid_records)
         ]
         deviation = self.detect_deviation(steps, ground_truth=ground_truth)
 

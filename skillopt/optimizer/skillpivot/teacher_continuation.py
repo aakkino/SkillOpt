@@ -25,7 +25,6 @@ def extract_action(response: str) -> str:
     m = re.search(r"<action>(.*?)</action>", response, re.DOTALL)
     if m:
         return m.group(1).strip()
-    # Fallback to json command or simple line
     return response.strip()
 
 
@@ -35,6 +34,49 @@ def extract_think(response: str) -> str:
     if m:
         return m.group(1).strip()
     return ""
+
+
+def extract_final_answer(text: str) -> str:
+    """Extract candidate final answer from FINISH: action or <answer> tags."""
+    m_ans = re.search(r"<answer>(.*?)</answer>", text, re.DOTALL | re.IGNORECASE)
+    if m_ans:
+        return m_ans.group(1).strip()
+    m_fin = re.search(r"finish:\s*(.*)", text, re.DOTALL | re.IGNORECASE)
+    if m_fin:
+        return m_fin.group(1).strip()
+    return ""
+
+
+def default_verify_answer(pred_answer: str, ground_truth: Any) -> bool:
+    """Verify if prediction matches ground truth using normalized token/exact matching."""
+    if not pred_answer or ground_truth is None:
+        return False
+    if isinstance(ground_truth, str):
+        gts = [ground_truth]
+    elif isinstance(ground_truth, (list, tuple, set)):
+        gts = [str(x) for x in ground_truth]
+    else:
+        gts = [str(ground_truth)]
+
+    def _norm(s: str) -> str:
+        s = s.lower().strip()
+        s = re.sub(r"[^\w\s]", "", s)
+        s = re.sub(r"\b(a|an|the)\b", " ", s)
+        return " ".join(s.split())
+
+    norm_pred = _norm(pred_answer)
+    pred_tokens = set(norm_pred.split())
+
+    for gt in gts:
+        norm_gt = _norm(gt)
+        if not norm_gt:
+            continue
+        if norm_pred == norm_gt or norm_pred in norm_gt or norm_gt in norm_pred:
+            return True
+        gt_tokens = set(norm_gt.split())
+        if pred_tokens and gt_tokens and (pred_tokens.issubset(gt_tokens) or gt_tokens.issubset(pred_tokens)):
+            return True
+    return False
 
 
 # ── Teacher Continuation Engine ──────────────────────────────────────────
@@ -49,11 +91,13 @@ class TeacherContinuationEngine:
         max_retries: int = 3,
         temperature: float = 0.7,
         max_completion_tokens: int = 8192,
+        allow_simulated: bool = False,
     ):
         self.max_steps = max_steps
         self.max_retries = max_retries
         self.temperature = temperature
         self.max_completion_tokens = max_completion_tokens
+        self.allow_simulated = allow_simulated
 
     def build_teacher_system_prompt(self, skill_content: str) -> str:
         """Construct teacher system prompt embedding active skill guidelines."""
@@ -117,19 +161,23 @@ class TeacherContinuationEngine:
         self,
         case: PairedSuffixCase,
         env_step_fn: Callable[[str], tuple[str, bool, float]] | None = None,
+        evaluator_fn: Callable[[str, Any], bool] | None = None,
         chat_fn: Callable[..., tuple[str, dict]] | None = None,
+        allow_simulated: bool | None = None,
     ) -> PairedSuffixCase:
         """Execute teacher continuation from t* for up to max_steps turns.
 
         Args:
             case: The PairedSuffixCase with populated prefix_steps and deviation.
             env_step_fn: Optional callable(action) -> (observation, is_done, reward).
-                         If None, uses simulated step or single-turn response.
+            evaluator_fn: Optional callable(predicted_answer, ground_truth) -> bool.
             chat_fn: LLM call function (defaults to chat_optimizer).
+            allow_simulated: Explicit flag whether unverified simulated execution is accepted.
         """
         call_fn = chat_fn or chat_optimizer
         system_prompt = self.build_teacher_system_prompt(case.skill_content)
         base_user_prompt = self.build_teacher_prefix_prompt(case)
+        sim_allowed = self.allow_simulated if allow_simulated is None else allow_simulated
 
         t_star = case.deviation.step_index if case.deviation else len(case.prefix_steps) + 1
 
@@ -153,7 +201,13 @@ class TeacherContinuationEngine:
                 reasoning = extract_think(raw_response)
 
                 # Check if teacher finishes or calls environment
-                is_finish = "finish:" in action.lower() or "final answer" in action.lower()
+                is_finish = (
+                    "finish:" in action.lower()
+                    or "final answer" in action.lower()
+                    or "<answer>" in raw_response.lower()
+                )
+
+                step_success = False
 
                 if env_step_fn is not None:
                     try:
@@ -161,15 +215,53 @@ class TeacherContinuationEngine:
                         exec_st = 0 if "error" in obs.lower() or not obs.strip() else 1
                     except Exception as e:
                         obs = f"Execution error: {e}"
-                        done = False
+                        done = True
                         reward = 0.0
                         exec_st = 0
+
+                    if reward > 0.0:
+                        step_success = True
+                    elif is_finish or done:
+                        # Differentiate episode termination from actual success:
+                        # If reward <= 0, only accept if explicit evaluator verifies the final answer
+                        cand_ans = extract_final_answer(action) or extract_final_answer(raw_response) or obs
+                        if evaluator_fn is not None and case.ground_truth:
+                            step_success = bool(evaluator_fn(cand_ans, case.ground_truth))
+                        else:
+                            step_success = False
+                elif case.ground_truth or evaluator_fn is not None:
+                    # No env_step_fn, but verifiable through ground_truth / evaluator
+                    if is_finish:
+                        cand_ans = extract_final_answer(action) or extract_final_answer(raw_response)
+                        if evaluator_fn is not None:
+                            step_success = bool(evaluator_fn(cand_ans, case.ground_truth))
+                        else:
+                            step_success = bool(default_verify_answer(cand_ans, case.ground_truth))
+
+                        done = True
+                        reward = 1.0 if step_success else 0.0
+                        obs = "Answer verified: OK" if step_success else "Answer verification failed: incorrect"
+                        exec_st = 1 if step_success else 0
+                    else:
+                        obs = "Simulated tool response: OK" if sim_allowed else "No environment step function available"
+                        done = not sim_allowed
+                        reward = 0.0
+                        exec_st = 1 if sim_allowed else 0
+                        step_success = False
                 else:
-                    # Simulated / self-contained environment step
-                    obs = "Simulated tool response: OK" if not is_finish else "Task finished"
-                    done = is_finish
-                    reward = 1.0 if is_finish else 0.0
-                    exec_st = 1
+                    # Neither env_step_fn nor verifiable ground_truth available
+                    if sim_allowed:
+                        obs = "Simulated tool response: OK" if not is_finish else "Task finished"
+                        done = is_finish
+                        reward = 1.0 if is_finish else 0.0
+                        exec_st = 1
+                        step_success = is_finish
+                    else:
+                        obs = "Error: Unverifiable task outcome (missing env_step_fn and ground_truth)"
+                        done = True
+                        reward = 0.0
+                        exec_st = 0
+                        step_success = False
 
                 step_record = TrajectoryStep(
                     step=current_step_num,
@@ -183,8 +275,11 @@ class TeacherContinuationEngine:
                 )
                 teacher_steps.append(step_record)
 
-                if done or is_finish:
+                if step_success:
                     success = True
+                    break
+                if done:
+                    # Episode ended without success
                     break
 
                 # Inline reflection hint (appended to prompt, but not in raw step_record)

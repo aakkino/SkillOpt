@@ -29,8 +29,10 @@ class SkillPivotPipeline:
         delta_generator: DeltaGenerator | None = None,
         verifier: RegressionGatedVerifier | None = None,
         gate_threshold: float = 0.5,
+        allow_simulated: bool = False,
     ):
-        self.teacher_engine = teacher_engine or TeacherContinuationEngine()
+        self.allow_simulated = allow_simulated
+        self.teacher_engine = teacher_engine or TeacherContinuationEngine(allow_simulated=allow_simulated)
         self.delta_generator = delta_generator or DeltaGenerator()
         self.verifier = verifier or RegressionGatedVerifier(threshold=gate_threshold)
 
@@ -39,6 +41,8 @@ class SkillPivotPipeline:
         paired_cases: list[PairedSuffixCase],
         current_skill: str,
         env_step_fn: Callable[[str], tuple[str, bool, float]] | None = None,
+        evaluator_fn: Callable[[str, Any], bool] | None = None,
+        allow_simulated: bool | None = None,
     ) -> tuple[str, list[SkillDelta], list[RegressionGateResult]]:
         """Run one optimization iteration across a batch of failed cases.
 
@@ -50,11 +54,17 @@ class SkillPivotPipeline:
         updated_skill = current_skill
         accepted_deltas: list[SkillDelta] = []
         gate_results: list[RegressionGateResult] = []
+        sim_allowed = self.allow_simulated if allow_simulated is None else allow_simulated
 
         for case in paired_cases:
             # Stage 3: Teacher Continuation (if not already simulated/run)
             if not case.teacher_success or not case.teacher_suffix:
-                case = self.teacher_engine.run_continuation(case, env_step_fn=env_step_fn)
+                case = self.teacher_engine.run_continuation(
+                    case,
+                    env_step_fn=env_step_fn,
+                    evaluator_fn=evaluator_fn,
+                    allow_simulated=sim_allowed,
+                )
 
             if not case.teacher_success:
                 logger.info(f"Task {case.task_id}: Teacher continuation failed. Skipping case.")

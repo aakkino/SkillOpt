@@ -63,7 +63,7 @@ def test_teacher_continuation_prompt_building():
 
 def test_teacher_continuation_simulated_execution():
     """Verify teacher continuation runs and finishes successfully."""
-    engine = TeacherContinuationEngine(max_steps=5)
+    engine = TeacherContinuationEngine(max_steps=5, allow_simulated=True)
     case = make_sample_case()
 
     # Mock chat_fn returning finish on step 2
@@ -84,6 +84,66 @@ def test_teacher_continuation_simulated_execution():
     assert res_case.teacher_suffix[1].step == 4
     assert res_case.teacher_suffix[0].action == "query balance"
     assert res_case.teacher_suffix[1].action == "FINISH: $5M"
+
+
+def test_teacher_continuation_verification_and_rejection():
+    """Verify teacher rejection on wrong answers, zero-reward stops, and unverifiable steps (P1 fix)."""
+    engine = TeacherContinuationEngine(max_steps=3, allow_simulated=False)
+
+    # 1. Wrong answer rejection with ground_truth
+    case_math = PairedSuffixCase(
+        task_id="case_math",
+        task_description="What is 2+2?",
+        ground_truth="4",
+    )
+    def mock_wrong_chat(system=None, user=None, **kw):
+        return "<action>FINISH: 5</action>", {}
+
+    res_wrong = engine.run_continuation(case_math, chat_fn=mock_wrong_chat)
+    assert res_wrong.teacher_success is False
+
+    # 2. Correct answer acceptance with ground_truth
+    def mock_correct_chat(system=None, user=None, **kw):
+        return "<action>FINISH: 4</action>", {}
+
+    res_correct = engine.run_continuation(case_math, chat_fn=mock_correct_chat)
+    assert res_correct.teacher_success is True
+
+    # 3. Environment terminated with zero reward (e.g. wrong answer, done=True, reward=0.0)
+    def mock_env_zero_reward(action):
+        return "wrong answer", True, 0.0
+
+    res_env_fail = engine.run_continuation(
+        case_math,
+        env_step_fn=mock_env_zero_reward,
+        chat_fn=lambda system=None, user=None, **kw: ("<action>submit 5</action>", {}),
+    )
+    assert res_env_fail.teacher_success is False
+
+    # 4. Environment terminated with positive reward (reward=1.0)
+    def mock_env_success(action):
+        return "success", True, 1.0
+
+    res_env_ok = engine.run_continuation(
+        case_math,
+        env_step_fn=mock_env_success,
+        chat_fn=lambda system=None, user=None, **kw: ("<action>submit 4</action>", {}),
+    )
+    assert res_env_ok.teacher_success is True
+
+    # 5. Production mode without env_step_fn or ground_truth must reject continuation
+    case_no_gt = PairedSuffixCase(
+        task_id="case_no_gt",
+        task_description="Open ended exploration",
+        ground_truth="",
+    )
+    res_no_verif = engine.run_continuation(
+        case_no_gt,
+        chat_fn=lambda system=None, user=None, **kw: ("<action>FINISH: done</action>", {}),
+        allow_simulated=False,
+    )
+    assert res_no_verif.teacher_success is False
+
 
 
 def test_delta_generator_contrast_and_apply():
