@@ -1450,9 +1450,11 @@ def test_pipeline_teacher_continuation_in_situ_reset_retry(monkeypatch):
 
 def test_teacher_continuation_builder_and_adapter_exception_logging(caplog):
     """Verify that when env_step_fn_builder or adapter raises an exception during environment
-    reconstruction/reset, the error is safely caught and logged without triggering NameError: name 'logger' is not defined.
+    reconstruction/reset, the error is safely caught and logged without triggering NameError,
+    and crucially, environment construction failure is NOT silently converted to a successful
+    answer verification (teacher_success remains False, preventing fake successful suffixes).
 
-    Regression test for round 8 review P2 finding.
+    Regression test for round 8 review P2 finding & round 9 review P1 finding.
     """
     import logging
 
@@ -1485,9 +1487,14 @@ def test_teacher_continuation_builder_and_adapter_exception_logging(caplog):
             chat_fn=mock_chat_answer,
         )
 
-    # Verify no NameError was raised and teacher continuation completed
-    assert res.teacher_success is True
+    # Verify no NameError was raised and failure state was preserved
+    assert res.teacher_success is False
     assert any("env_step_fn_builder error on attempt 1: checkpoint unavailable" in r.message for r in caplog.records)
+    assert any("env_step_fn_builder error on attempt 2: checkpoint unavailable" in r.message for r in caplog.records)
+    assert len(res.teacher_suffix) == 1
+    assert res.teacher_suffix[0].action == "ENVIRONMENT_ERROR"
+    assert "checkpoint unavailable" in res.teacher_suffix[0].observation
+    assert res.teacher_suffix[0].execution_status == 0
 
     caplog.clear()
 
@@ -1503,8 +1510,11 @@ def test_teacher_continuation_builder_and_adapter_exception_logging(caplog):
             chat_fn=mock_chat_answer,
         )
 
-    assert res2.teacher_success is True
+    assert res2.teacher_success is False
     assert any("failed to rebuild step fn on attempt 1: adapter rebuild failed" in r.message for r in caplog.records)
+    assert len(res2.teacher_suffix) == 1
+    assert res2.teacher_suffix[0].action == "ENVIRONMENT_ERROR"
+    assert "adapter rebuild failed" in res2.teacher_suffix[0].observation
 
     caplog.clear()
 
@@ -1536,6 +1546,284 @@ def test_teacher_continuation_builder_and_adapter_exception_logging(caplog):
 
     # Verify no NameError was raised and reset warning logged
     assert any("adapter.reset_continuation_env error on attempt 2: reset environment failed" in r.message for r in caplog.records)
+
+
+# ── 16. Round 9 Regression: Environment Construction Failure vs Explicit QA Mode ──
+
+
+def test_environment_construction_failure_rejected_in_pipeline_while_searchqa_succeeds(monkeypatch):
+    """Verify that when an interactive environment adapter fails to build continuation step function
+    (e.g. raises RuntimeError), the pipeline preserves the failure status, rejects the attempt,
+    and skips delta generation / skill update, even if gold_answers are present and the teacher
+    outputs a matching answer.
+
+    Conversely, when an adapter explicitly declares stateless QA takeover by returning None
+    (e.g. SearchQAAdapter), pure answer verification against gold answers remains supported and succeeds.
+
+    Regression test for round 9 review P1 finding.
+    """
+    from skillopt.envs.base import EnvAdapter
+    from skillopt.envs.searchqa.adapter import SearchQAAdapter
+    from skillopt.optimizer.skillpivot import delta_generator, regression_verifier, teacher_continuation
+    from skillopt.optimizer.skillpivot.pipeline import SkillPivotPipeline
+    from skillopt.types import DeviationPoint, PairedSuffixCase
+
+    # ── 1. Interactive Adapter with Construction Exception: Must be rejected ──
+    class InteractiveFailingAdapter(EnvAdapter):
+        def build_train_env(self, batch_size, seed, **kwargs):
+            return []
+
+        def build_eval_env(self, env_num, split, seed, **kwargs):
+            return []
+
+        def rollout(self, env_manager, skill_content, out_dir, **kwargs):
+            return []
+
+        def get_task_types(self):
+            return ["interactive"]
+
+        def build_continuation_step_fn(self, case, **kwargs):
+            raise RuntimeError("checkpoint unavailable")
+
+    def mock_chat_interactive_bypass(system, user, stage="", **kw):
+        if stage == "teacher_continuation":
+            return "<think>Bypass tool</think><action>FINISH: 4</action>", {}
+        return "{}", {}
+
+    monkeypatch.setattr(teacher_continuation, "chat_optimizer", mock_chat_interactive_bypass)
+    monkeypatch.setattr(delta_generator, "chat_optimizer", mock_chat_interactive_bypass)
+    monkeypatch.setattr(regression_verifier, "chat_optimizer", mock_chat_interactive_bypass)
+
+    pipeline = SkillPivotPipeline(allow_simulated=False, teacher_max_steps=5)
+    pipeline.teacher_engine.max_retries = 2
+
+    interactive_case = PairedSuffixCase(
+        task_id="task_interactive_fail",
+        task_description="Execute interactive tools to compute answer.",
+        ground_truth="4",
+        gold_answers=["4"],
+        prefix_steps=[],
+        deviation=DeviationPoint(step_index=1, trough_potential=0.0, pre_mean_potential=0.0, post_mean_potential=0.0),
+    )
+
+    updated_skill, accepted_deltas, gate_results = pipeline.optimize_step(
+        paired_cases=[interactive_case],
+        current_skill="# Initial Skill",
+        adapter=InteractiveFailingAdapter(),
+    )
+
+    # Verification: teacher must NOT succeed, no suffix accepted, no delta generated
+    assert interactive_case.teacher_success is False
+    assert len(accepted_deltas) == 0
+    assert len(gate_results) == 0
+    assert updated_skill == "# Initial Skill"
+    assert len(interactive_case.teacher_suffix) == 1
+    assert interactive_case.teacher_suffix[0].action == "ENVIRONMENT_ERROR"
+    assert "checkpoint unavailable" in interactive_case.teacher_suffix[0].observation
+
+    # ── 2. SearchQA Adapter Explicit Stateless QA: Must succeed on answer match ──
+    searchqa_adapter = SearchQAAdapter(max_turns=3)
+
+    def mock_chat_searchqa(system, user, stage="", **kw):
+        if stage == "teacher_continuation":
+            return "<think>Exact answer</think><action>FINISH: 4</action>", {}
+        elif stage == "contrast_analysis":
+            return json.dumps({
+                "student_mistake": "Wrong calculation",
+                "teacher_correction": "Answer 4",
+                "skill_gap": "Need accurate answer rule",
+                "evolution_direction": "Add rule for 4",
+            }), {}
+        elif stage == "delta_generation":
+            return json.dumps({
+                "action": "improve_skill",
+                "target_rule": "Calculation",
+                "content": "Verify calculation yields 4.",
+                "trigger_condition": "When calculating",
+                "rationale": "Matches ground truth",
+            }), {}
+        elif stage == "regression_verification":
+            return json.dumps({
+                "no_regression_score": 0.95,
+                "generalizable_rule_score": 0.95,
+                "critique": "Correct QA update",
+            }), {}
+        return "{}", {}
+
+    monkeypatch.setattr(teacher_continuation, "chat_optimizer", mock_chat_searchqa)
+    monkeypatch.setattr(delta_generator, "chat_optimizer", mock_chat_searchqa)
+    monkeypatch.setattr(regression_verifier, "chat_optimizer", mock_chat_searchqa)
+
+    qa_case = PairedSuffixCase(
+        task_id="task_searchqa_normal",
+        task_description="What is 2 + 2?",
+        ground_truth="4",
+        gold_answers=["4"],
+        prefix_steps=[],
+        deviation=DeviationPoint(step_index=1, trough_potential=0.0, pre_mean_potential=0.0, post_mean_potential=0.0),
+    )
+
+    updated_skill_qa, accepted_deltas_qa, gate_results_qa = pipeline.optimize_step(
+        paired_cases=[qa_case],
+        current_skill="# Initial Skill",
+        adapter=searchqa_adapter,
+    )
+
+    # Verification: SearchQA explicit QA mode succeeds normally
+    assert qa_case.teacher_success is True
+    assert len(accepted_deltas_qa) == 1
+    assert "Verify calculation yields 4." in updated_skill_qa
+    assert len(qa_case.teacher_suffix) == 1
+    assert qa_case.teacher_suffix[0].action == "FINISH: 4"
+    assert qa_case.teacher_suffix[0].observation == "Answer verified: OK"
+    assert qa_case.teacher_suffix[0].done is True
+    assert qa_case.teacher_suffix[0].reward == 1.0
+
+
+# ── 17. Round 9 Regression: Bound Step/Reset Retry Without Adapter ────────────
+
+
+def test_pipeline_stateful_bound_env_step_reset_retry_without_adapter(monkeypatch):
+    """Verify that when running through SkillPivotPipeline.optimize_step with env_step_fn=env.step
+    and NO adapter (or an adapter without reset_continuation_env override), the pipeline and engine
+    correctly invoke the bound env.reset method before retry attempt 2 rather than falsely treating
+    a no-op reset callback as having reset the environment.
+
+    Regression test for round 9 review P2 finding.
+    """
+    from skillopt.envs.base import EnvAdapter
+    from skillopt.optimizer.skillpivot import delta_generator, regression_verifier, teacher_continuation
+    from skillopt.optimizer.skillpivot.pipeline import SkillPivotPipeline
+    from skillopt.types import DeviationPoint, PairedSuffixCase
+
+    class StatefulEnvWithoutAdapter:
+        def __init__(self):
+            self.is_terminated = False
+            self.actions_received = []
+            self.reset_calls = []
+
+        def reset(self, attempt=1):
+            self.reset_calls.append(attempt)
+            self.is_terminated = False
+
+        def step(self, action: str):
+            self.actions_received.append(action)
+            if self.is_terminated:
+                return "Episode already terminated: invalid action after done=True", True, 0.0
+
+            if action == "wrong action":
+                self.is_terminated = True
+                return "Failed on wrong step", True, 0.0
+            elif action == "correct action":
+                self.is_terminated = True
+                return "Task completed successfully!", True, 1.0
+            return "Progress", False, 0.0
+
+    attempt_counter = 0
+
+    def mock_chat_bound_retry(system, user, stage="", **kw):
+        nonlocal attempt_counter
+        if stage == "teacher_continuation":
+            if attempt_counter == 0:
+                attempt_counter += 1
+                return "<think>Try initial action</think><action>wrong action</action>", {}
+            else:
+                attempt_counter += 1
+                return "<think>Try corrected action</think><action>correct action</action>", {}
+        elif stage == "contrast_analysis":
+            return json.dumps({
+                "student_mistake": "Failed action",
+                "teacher_correction": "Use correct action",
+                "skill_gap": "Need rule",
+                "evolution_direction": "Add rule",
+            }), {}
+        elif stage == "delta_generation":
+            return json.dumps({
+                "action": "improve_skill",
+                "target_rule": "Action Choice",
+                "content": "Always choose correct action.",
+                "trigger_condition": "When choosing",
+                "rationale": "Leads to success",
+            }), {}
+        elif stage == "regression_verification":
+            return json.dumps({
+                "no_regression_score": 0.95,
+                "generalizable_rule_score": 0.95,
+                "critique": "Good update",
+            }), {}
+        return "{}", {}
+
+    monkeypatch.setattr(teacher_continuation, "chat_optimizer", mock_chat_bound_retry)
+    monkeypatch.setattr(delta_generator, "chat_optimizer", mock_chat_bound_retry)
+    monkeypatch.setattr(regression_verifier, "chat_optimizer", mock_chat_bound_retry)
+
+    pipeline = SkillPivotPipeline(allow_simulated=False, teacher_max_steps=5)
+    pipeline.teacher_engine.max_retries = 2
+
+    # ── Branch A: env_step_fn=env.step directly without adapter ──
+    env_direct = StatefulEnvWithoutAdapter()
+    case_direct = PairedSuffixCase(
+        task_id="task_bound_direct",
+        task_description="Perform action to complete stateful task.",
+        ground_truth="",
+        gold_answers=[],
+        prefix_steps=[],
+        deviation=DeviationPoint(step_index=1, trough_potential=0.0, pre_mean_potential=0.0, post_mean_potential=0.0),
+    )
+
+    attempt_counter = 0
+    updated_skill_dir, accepted_deltas_dir, _ = pipeline.optimize_step(
+        paired_cases=[case_direct],
+        current_skill="# Initial Skill",
+        env_step_fn=env_direct.step,
+        adapter=None,
+    )
+
+    assert case_direct.teacher_success is True
+    assert env_direct.reset_calls == [2]
+    assert env_direct.actions_received == ["wrong action", "correct action"]
+    assert len(accepted_deltas_dir) == 1
+    assert "Always choose correct action." in updated_skill_dir
+
+    # ── Branch B: adapter inherits EnvAdapter but does NOT override reset_continuation_env ──
+    class BaseNoopAdapter(EnvAdapter):
+        def build_train_env(self, batch_size, seed, **kwargs):
+            return []
+
+        def build_eval_env(self, env_num, split, seed, **kwargs):
+            return []
+
+        def rollout(self, env_manager, skill_content, out_dir, **kwargs):
+            return []
+
+        def get_task_types(self):
+            return ["noop_reset"]
+
+        def build_continuation_step_fn(self, case, **kwargs):
+            return env_noop.step
+
+    env_noop = StatefulEnvWithoutAdapter()
+    case_noop = PairedSuffixCase(
+        task_id="task_bound_noop_adapter",
+        task_description="Perform action with base adapter.",
+        ground_truth="",
+        gold_answers=[],
+        prefix_steps=[],
+        deviation=DeviationPoint(step_index=1, trough_potential=0.0, pre_mean_potential=0.0, post_mean_potential=0.0),
+    )
+
+    attempt_counter = 0
+    updated_skill_noop, accepted_deltas_noop, _ = pipeline.optimize_step(
+        paired_cases=[case_noop],
+        current_skill="# Initial Skill",
+        adapter=BaseNoopAdapter(),
+    )
+
+    assert case_noop.teacher_success is True
+    assert env_noop.reset_calls == [2]
+    assert env_noop.actions_received == ["wrong action", "correct action"]
+    assert len(accepted_deltas_noop) == 1
+    assert "Always choose correct action." in updated_skill_noop
 
 
 

@@ -66,22 +66,67 @@ class SkillPivotPipeline:
         sim_allowed = self.allow_simulated if allow_simulated is None else allow_simulated
 
         for case in paired_cases:
+            from skillopt.envs.base import EnvAdapter
+
             last_reset_attempt = [0]
 
-            def _env_reset(attempt: int = 1):
-                if attempt > 1 and last_reset_attempt[0] != attempt:
-                    if adapter is not None and hasattr(adapter, "reset_continuation_env"):
+            def _env_reset(attempt: int = 1) -> bool:
+                if attempt <= 1:
+                    return False
+                if last_reset_attempt[0] == attempt:
+                    return True
+
+                performed = False
+                # 1. 尝试调用 adapter 的 reset_continuation_env（若非基类空实现）
+                if adapter is not None and hasattr(adapter, "reset_continuation_env"):
+                    is_base_noop = getattr(type(adapter), "reset_continuation_env", None) is EnvAdapter.reset_continuation_env
+                    if not is_base_noop:
                         try:
-                            adapter.reset_continuation_env(case, train_env=train_env, attempt=attempt, **kwargs)
+                            res = adapter.reset_continuation_env(case, train_env=train_env, attempt=attempt, **kwargs)
+                            if res is not False:
+                                performed = True
                         except TypeError:
                             try:
-                                adapter.reset_continuation_env(case, train_env=train_env, attempt=attempt)
+                                res = adapter.reset_continuation_env(case, train_env=train_env, attempt=attempt)
+                                if res is not False:
+                                    performed = True
                             except TypeError:
                                 try:
-                                    adapter.reset_continuation_env(case, train_env=train_env)
+                                    res = adapter.reset_continuation_env(case, train_env=train_env)
+                                    if res is not False:
+                                        performed = True
                                 except TypeError:
-                                    adapter.reset_continuation_env(case)
+                                    res = adapter.reset_continuation_env(case)
+                                    if res is not False:
+                                        performed = True
+
+                # 2. 若 adapter 未重置，尝试调用 env_step_fn 绑定的 reset
+                if not performed and callable(env_step_fn):
+                    target_reset = None
+                    if hasattr(env_step_fn, "reset") and callable(env_step_fn.reset):
+                        target_reset = env_step_fn.reset
+                    elif hasattr(getattr(env_step_fn, "__self__", None), "reset") and callable(getattr(env_step_fn, "__self__").reset):
+                        target_reset = getattr(env_step_fn, "__self__").reset
+
+                    if target_reset is not None:
+                        try:
+                            res = target_reset(attempt)
+                            if res is not False:
+                                performed = True
+                        except TypeError:
+                            try:
+                                res = target_reset()
+                                if res is not False:
+                                    performed = True
+                            except Exception as e:
+                                logger.warning(f"Task {case.task_id}: env_step_fn bound reset error on attempt {attempt}: {e}")
+                        except Exception as e:
+                            logger.warning(f"Task {case.task_id}: env_step_fn bound reset error on attempt {attempt}: {e}")
+
+                if performed:
                     last_reset_attempt[0] = attempt
+                    return True
+                return False
 
             def _step_fn_builder(attempt: int = 1):
                 if attempt > 1:
@@ -117,9 +162,7 @@ class SkillPivotPipeline:
                             return adapter.build_continuation_step_fn(case, train_env=train_env)
                         except TypeError:
                             return adapter.build_continuation_step_fn(case)
-                    except Exception as e:
-                        logger.warning(f"Task {case.task_id}: failed to build continuation step fn from adapter: {e}")
-                        return None
+                    # 保留真实环境构造异常向外抛出，供 TeacherContinuationEngine 捕获并记录失败，严禁吞掉降级为纯答案验证
                 return None
 
             # Resolve task-specific evaluator function
@@ -143,17 +186,33 @@ class SkillPivotPipeline:
                 except Exception:
                     pass
 
+            # 仅在实际存在可用 reset 实现时向引擎传递 reset 回调
+            has_adapter_reset = (
+                adapter is not None
+                and hasattr(adapter, "reset_continuation_env")
+                and getattr(type(adapter), "reset_continuation_env", None) is not EnvAdapter.reset_continuation_env
+            )
+            has_step_reset = (
+                callable(env_step_fn)
+                and (
+                    (hasattr(env_step_fn, "reset") and callable(env_step_fn.reset))
+                    or (hasattr(getattr(env_step_fn, "__self__", None), "reset") and callable(getattr(env_step_fn, "__self__").reset))
+                )
+            )
+            effective_env_reset_fn = _env_reset if (has_adapter_reset or has_step_reset) else None
+
             # Stage 3: Teacher Continuation (if not already simulated/run)
             if not case.teacher_success or not case.teacher_suffix:
+                initial_step_fn = env_step_fn if callable(env_step_fn) else None
                 case = self.teacher_engine.run_continuation(
                     case,
-                    env_step_fn=_step_fn_builder(1),
+                    env_step_fn=initial_step_fn,
                     evaluator_fn=case_evaluator_fn,
                     allow_simulated=sim_allowed,
                     adapter=adapter,
                     train_env=train_env,
                     env_step_fn_builder=_step_fn_builder,
-                    env_reset_fn=_env_reset,
+                    env_reset_fn=effective_env_reset_fn,
                 )
 
             if not case.teacher_success:

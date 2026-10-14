@@ -252,12 +252,14 @@ class TeacherContinuationEngine:
                 # 1. Custom env_reset_fn
                 if env_reset_fn is not None:
                     try:
-                        env_reset_fn(attempt)
-                        did_reset = True
+                        res = env_reset_fn(attempt)
+                        if res is not False:
+                            did_reset = True
                     except TypeError:
                         try:
-                            env_reset_fn()
-                            did_reset = True
+                            res = env_reset_fn()
+                            if res is not False:
+                                did_reset = True
                         except Exception as e:
                             logger.warning(f"Task {case.task_id}: env_reset_fn error on attempt {attempt}: {e}")
                     except Exception as e:
@@ -265,32 +267,43 @@ class TeacherContinuationEngine:
 
                 # 2. Adapter reset_continuation_env hook
                 if not did_reset and adapter is not None and hasattr(adapter, "reset_continuation_env"):
-                    try:
-                        adapter.reset_continuation_env(case, train_env=train_env, attempt=attempt)
-                        did_reset = True
-                    except TypeError:
+                    from skillopt.envs.base import EnvAdapter
+                    is_base_noop = getattr(type(adapter), "reset_continuation_env", None) is EnvAdapter.reset_continuation_env
+                    if not is_base_noop:
                         try:
-                            adapter.reset_continuation_env(case, train_env=train_env)
-                            did_reset = True
+                            res = adapter.reset_continuation_env(case, train_env=train_env, attempt=attempt)
+                            if res is not False:
+                                did_reset = True
                         except TypeError:
                             try:
-                                adapter.reset_continuation_env(case)
-                                did_reset = True
+                                res = adapter.reset_continuation_env(case, train_env=train_env)
+                                if res is not False:
+                                    did_reset = True
+                            except TypeError:
+                                try:
+                                    res = adapter.reset_continuation_env(case)
+                                    if res is not False:
+                                        did_reset = True
+                                except Exception as e:
+                                    logger.warning(f"Task {case.task_id}: adapter.reset_continuation_env error on attempt {attempt}: {e}")
                             except Exception as e:
                                 logger.warning(f"Task {case.task_id}: adapter.reset_continuation_env error on attempt {attempt}: {e}")
                         except Exception as e:
                             logger.warning(f"Task {case.task_id}: adapter.reset_continuation_env error on attempt {attempt}: {e}")
-                    except Exception as e:
-                        logger.warning(f"Task {case.task_id}: adapter.reset_continuation_env error on attempt {attempt}: {e}")
 
             # Resolve / rebuild environment step function for this attempt
             active_env_step_fn = None
+            env_construction_failed = False
+            env_error_message = ""
+
             if env_step_fn_builder is not None:
                 try:
                     active_env_step_fn = env_step_fn_builder(attempt)
                 except Exception as e:
                     logger.warning(f"Task {case.task_id}: env_step_fn_builder error on attempt {attempt}: {e}")
                     active_env_step_fn = None
+                    env_construction_failed = True
+                    env_error_message = str(e)
             elif adapter is not None and hasattr(adapter, "build_continuation_step_fn"):
                 try:
                     active_env_step_fn = adapter.build_continuation_step_fn(
@@ -306,6 +319,8 @@ class TeacherContinuationEngine:
                 except Exception as e:
                     logger.warning(f"Task {case.task_id}: failed to rebuild step fn on attempt {attempt}: {e}")
                     active_env_step_fn = None
+                    env_construction_failed = True
+                    env_error_message = str(e)
             elif env_step_fn is not None:
                 active_env_step_fn = env_step_fn
 
@@ -319,16 +334,33 @@ class TeacherContinuationEngine:
 
                 if reset_fn is not None:
                     try:
-                        reset_fn(attempt)
-                        did_reset = True
+                        res = reset_fn(attempt)
+                        if res is not False:
+                            did_reset = True
                     except TypeError:
                         try:
-                            reset_fn()
-                            did_reset = True
+                            res = reset_fn()
+                            if res is not False:
+                                did_reset = True
                         except Exception as e:
                             logger.warning(f"Task {case.task_id}: active_env_step_fn reset error on attempt {attempt}: {e}")
                     except Exception as e:
                         logger.warning(f"Task {case.task_id}: active_env_step_fn reset error on attempt {attempt}: {e}")
+
+            if env_construction_failed:
+                obs = f"Environment construction failed: {env_error_message}"
+                step_record = TrajectoryStep(
+                    step=t_star,
+                    action="ENVIRONMENT_ERROR",
+                    observation=obs,
+                    reasoning="",
+                    raw_model_response="",
+                    reward=0.0,
+                    done=True,
+                    execution_status=0,
+                )
+                teacher_steps.append(step_record)
+                continue
 
             for step_offset in range(self.max_steps):
                 current_step_num = t_star + step_offset
