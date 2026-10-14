@@ -2396,6 +2396,493 @@ def test_old_environment_reset_failure_does_not_reject_clean_independent_builder
     assert clean_envs_created_false[0].actions == ["fetch_item"]
 
 
+# ── 19. Round 12 Regression: Explicit Step Function Priority Over Adapter Hook ──
+
+
+def test_explicit_env_step_fn_priority_over_adapter_default_none_hook(monkeypatch):
+    """Verify that when both an adapter (whose build_continuation_step_fn returns None by default)
+    and an explicit fixed env_step_fn are provided to SkillPivotPipeline.optimize_step, the explicit
+    env_step_fn is reliably executed rather than discarded, preventing unreached terminal states
+    from being falsely accepted as stateless QA success.
+
+    Regression test for round 12 review P1 finding:
+    Prior code placed the adapter continuation branch before callable(env_step_fn) and directly
+    returned adapter.build_continuation_step_fn(case) without falling back when it returned None,
+    causing real environment callbacks to be skipped and gold_answers to falsely pass.
+    """
+    from skillopt.envs.base import EnvAdapter
+    from skillopt.optimizer.skillpivot import delta_generator, regression_verifier, teacher_continuation
+    from skillopt.optimizer.skillpivot.pipeline import SkillPivotPipeline
+    from skillopt.types import DeviationPoint, PairedSuffixCase
+
+    step_calls = []
+
+    def mock_env_step(action: str):
+        step_calls.append(action)
+        # Even if teacher provides FINISH: 4, the environment explicitly reports non-terminal done=False
+        return "goal is not yet reached", False, 0.0
+
+    class DefaultHookAdapter(EnvAdapter):
+        def build_train_env(self, batch_size, seed, **kwargs):
+            return []
+
+        def build_eval_env(self, env_num, split, seed, **kwargs):
+            return []
+
+        def rollout(self, env_manager, skill_content, out_dir, **kwargs):
+            return []
+
+        def get_task_types(self):
+            return ["default_hook"]
+
+    def mock_chat_priority(system, user, stage="", **kw):
+        if stage == "teacher_continuation":
+            return "<think>Direct finish</think><action>FINISH: 4</action>", {}
+        return "{}", {}
+
+    monkeypatch.setattr(teacher_continuation, "chat_optimizer", mock_chat_priority)
+    monkeypatch.setattr(delta_generator, "chat_optimizer", mock_chat_priority)
+    monkeypatch.setattr(regression_verifier, "chat_optimizer", mock_chat_priority)
+
+    adapter = DefaultHookAdapter()
+    pipeline = SkillPivotPipeline(allow_simulated=False, teacher_max_steps=2)
+
+    case = PairedSuffixCase(
+        task_id="task_p1_priority",
+        task_description="Solve calculation with environment step.",
+        ground_truth="4",
+        gold_answers=["4"],
+        prefix_steps=[],
+        deviation=DeviationPoint(step_index=1, trough_potential=0.0, pre_mean_potential=0.0, post_mean_potential=0.0),
+    )
+
+    updated_skill, accepted_deltas, _ = pipeline.optimize_step(
+        paired_cases=[case],
+        current_skill="# Initial Skill",
+        env_step_fn=mock_env_step,
+        adapter=adapter,
+    )
+
+    # Verification:
+    # 1. The explicit step callback MUST have been executed
+    assert len(step_calls) > 0
+    assert step_calls[0] == "FINISH: 4"
+    # 2. Since the environment step returned done=False, the task MUST NOT be accepted as success
+    assert case.teacher_success is False
+    assert len(accepted_deltas) == 0
+    assert updated_skill == "# Initial Skill"
+
+
+# ── 20. Round 12 Regression: Recreated Closure Reusing Same Polluted Environment ─
+
+
+def test_recreated_closure_reusing_polluted_underlying_env_rejected_while_fresh_builder_succeeds(monkeypatch):
+    """Verify that when an adapter returns a new closure callable on each attempt but the closure
+    operates on the same underlying stateful environment without reset, the pipeline accurately
+    detects the underlying instance pollution via closure inspection and blocks attempt 2 with RESET_ERROR,
+    preventing non-replayable suffixes from being accepted. Also verifies that a genuine fresh builder
+    succeeds cleanly.
+
+    Regression test for round 12 review P1 finding.
+    """
+    from skillopt.envs.base import EnvAdapter
+    from skillopt.optimizer.skillpivot import delta_generator, regression_verifier, teacher_continuation
+    from skillopt.optimizer.skillpivot.pipeline import SkillPivotPipeline
+    from skillopt.types import DeviationPoint, PairedSuffixCase
+
+    class SneakyClosureAdapter(EnvAdapter):
+        def __init__(self):
+            super().__init__()
+            self.door_open = False
+            self.step_calls = []
+
+        def build_train_env(self, batch_size, seed, **kwargs):
+            return []
+
+        def build_eval_env(self, env_num, split, seed, **kwargs):
+            return []
+
+        def rollout(self, env_manager, skill_content, out_dir, **kwargs):
+            return []
+
+        def get_task_types(self):
+            return ["closure_test"]
+
+        def build_continuation_step_fn(self, case, **kwargs):
+            # Every invocation returns a brand new function closure object (new callable identity)
+            def closure_step(action: str):
+                self.step_calls.append(action)
+                if action == "open":
+                    self.door_open = True
+                    return "door opened", False, 0.0
+                elif action == "collect":
+                    if self.door_open:
+                        return "item collected", True, 1.0
+                    return "door closed", True, 0.0
+                return "unknown action", False, 0.0
+
+            return closure_step
+
+    attempt_counter = 0
+
+    def mock_chat_closure(system, user, stage="", **kw):
+        nonlocal attempt_counter
+        if stage == "teacher_continuation":
+            attempt_counter += 1
+            if attempt_counter == 1:
+                return "<think>Open door</think><action>open</action>", {}
+            else:
+                return "<think>Collect item</think><action>collect</action>", {}
+        return "{}", {}
+
+    monkeypatch.setattr(teacher_continuation, "chat_optimizer", mock_chat_closure)
+    monkeypatch.setattr(delta_generator, "chat_optimizer", mock_chat_closure)
+    monkeypatch.setattr(regression_verifier, "chat_optimizer", mock_chat_closure)
+
+    # ── Branch A: Sneaky closure reusing same adapter state ──
+    adapter = SneakyClosureAdapter()
+    pipeline = SkillPivotPipeline(allow_simulated=False, teacher_max_steps=1)
+    pipeline.teacher_engine.max_retries = 2
+
+    case_sneaky = PairedSuffixCase(
+        task_id="task_p1_sneaky_closure",
+        task_description="Open door and collect reward.",
+        ground_truth="",
+        gold_answers=[],
+        prefix_steps=[],
+        deviation=DeviationPoint(step_index=1, trough_potential=0.0, pre_mean_potential=0.0, post_mean_potential=0.0),
+    )
+
+    attempt_counter = 0
+    updated_skill_sneaky, accepted_deltas_sneaky, _ = pipeline.optimize_step(
+        paired_cases=[case_sneaky],
+        current_skill="# Initial Skill",
+        adapter=adapter,
+    )
+
+    # Verification: attempt 2 was blocked by RESET_ERROR because closure_step captured self (polluted adapter)
+    assert case_sneaky.teacher_success is False
+    assert len(accepted_deltas_sneaky) == 0
+    assert updated_skill_sneaky == "# Initial Skill"
+    assert adapter.step_calls == ["open"]
+    assert not any(step.action == "collect" for step in case_sneaky.teacher_suffix)
+    assert len(case_sneaky.teacher_suffix) == 1
+    assert case_sneaky.teacher_suffix[0].action == "open"
+
+    # ── Branch B: Genuine clean builder creating fresh instance on each attempt ──
+    class FreshDoorEnv:
+        def __init__(self):
+            self.door_open = False
+            self.actions = []
+
+        def step(self, action: str):
+            self.actions.append(action)
+            if action == "open_and_collect":
+                self.door_open = True
+                return "door opened and item collected", True, 1.0
+            return "failed", True, 0.0
+
+    fresh_envs_created = []
+
+    def fresh_builder(attempt: int = 1):
+        env = FreshDoorEnv()
+        fresh_envs_created.append(env)
+        # Returns fresh closure capturing fresh env
+        def fresh_step(action: str):
+            return env.step(action)
+        return fresh_step
+
+    def mock_chat_fresh(system, user, stage="", **kw):
+        nonlocal attempt_counter
+        if stage == "teacher_continuation":
+            attempt_counter += 1
+            if attempt_counter == 1:
+                return "<think>Wrong action</think><action>wrong</action>", {}
+            else:
+                return "<think>Correct composite action</think><action>open_and_collect</action>", {}
+        elif stage == "contrast_analysis":
+            return json.dumps({
+                "student_mistake": "Failed action",
+                "teacher_correction": "Use open_and_collect",
+                "skill_gap": "Need open_and_collect rule",
+                "evolution_direction": "Add open_and_collect rule",
+            }), {}
+        elif stage == "delta_generation":
+            return json.dumps({
+                "action": "improve_skill",
+                "target_rule": "Door Operation",
+                "content": "Execute open_and_collect atomically.",
+                "trigger_condition": "When dealing with closed door",
+                "rationale": "Succeeds cleanly",
+            }), {}
+        elif stage == "regression_verification":
+            return json.dumps({
+                "no_regression_score": 0.96,
+                "generalizable_rule_score": 0.95,
+                "critique": "Solid update",
+            }), {}
+        return "{}", {}
+
+    monkeypatch.setattr(teacher_continuation, "chat_optimizer", mock_chat_fresh)
+    monkeypatch.setattr(delta_generator, "chat_optimizer", mock_chat_fresh)
+    monkeypatch.setattr(regression_verifier, "chat_optimizer", mock_chat_fresh)
+
+    pipeline_fresh = SkillPivotPipeline(allow_simulated=False, teacher_max_steps=1)
+    pipeline_fresh.teacher_engine.max_retries = 2
+
+    case_fresh = PairedSuffixCase(
+        task_id="task_p1_fresh_builder",
+        task_description="Open door and collect cleanly.",
+        ground_truth="",
+        gold_answers=[],
+        prefix_steps=[],
+        deviation=DeviationPoint(step_index=1, trough_potential=0.0, pre_mean_potential=0.0, post_mean_potential=0.0),
+    )
+
+    attempt_counter = 0
+    updated_skill_fresh, accepted_deltas_fresh, _ = pipeline_fresh.optimize_step(
+        paired_cases=[case_fresh],
+        current_skill="# Initial Skill",
+        env_step_fn_builder=fresh_builder,
+        adapter=None,
+    )
+
+    assert case_fresh.teacher_success is True
+    assert len(accepted_deltas_fresh) == 1
+    assert "Execute open_and_collect atomically." in updated_skill_fresh
+    assert len(fresh_envs_created) == 2
+    assert fresh_envs_created[0].actions == ["wrong"]
+    assert fresh_envs_created[1].actions == ["open_and_collect"]
+
+
+# ── 21. Round 12 Regression: Unhashable Dataclass Environment and Callable ──────
+
+
+def test_unhashable_dataclass_environment_and_callable_retry_lifecycle(monkeypatch):
+    """Verify that mutable dataclasses (with default __hash__=None) and callable dataclasses
+    can be used as environments and step functions across successful first attempts and
+    multi-attempt retry lifecycles without raising TypeError: unhashable type.
+
+    Regression test for round 12 review P2 finding.
+    """
+    from dataclasses import dataclass, field
+    from skillopt.optimizer.skillpivot import delta_generator, regression_verifier, teacher_continuation
+    from skillopt.optimizer.skillpivot.pipeline import SkillPivotPipeline
+    from skillopt.types import DeviationPoint, PairedSuffixCase
+
+    def mock_chat_dataclass(system, user, stage="", **kw):
+        if stage == "teacher_continuation":
+            return "<think>Act</think><action>do_task</action>", {}
+        elif stage == "contrast_analysis":
+            return json.dumps({
+                "student_mistake": "Failed task",
+                "teacher_correction": "Do task correctly",
+                "skill_gap": "Need task rule",
+                "evolution_direction": "Add task rule",
+            }), {}
+        elif stage == "delta_generation":
+            return json.dumps({
+                "action": "improve_skill",
+                "target_rule": "Task Execution",
+                "content": "Follow unhashable dataclass execution.",
+                "trigger_condition": "When running dataclass env",
+                "rationale": "Succeeds without TypeError",
+            }), {}
+        elif stage == "regression_verification":
+            return json.dumps({
+                "no_regression_score": 0.95,
+                "generalizable_rule_score": 0.95,
+                "critique": "Solid update",
+            }), {}
+        return "{}", {}
+
+    monkeypatch.setattr(teacher_continuation, "chat_optimizer", mock_chat_dataclass)
+    monkeypatch.setattr(delta_generator, "chat_optimizer", mock_chat_dataclass)
+    monkeypatch.setattr(regression_verifier, "chat_optimizer", mock_chat_dataclass)
+
+    pipeline = SkillPivotPipeline(allow_simulated=False, teacher_max_steps=1)
+
+    # ── Branch A: Normal mutable dataclass environment with method binding ──
+    @dataclass
+    class UnhashableDataEnv:
+        actions: list[str] = field(default_factory=list)
+
+        def step(self, action: str):
+            self.actions.append(action)
+            return "goal reached", True, 1.0
+
+    env_a = UnhashableDataEnv()
+    assert getattr(env_a, "__hash__") is None  # explicitly verify unhashable
+
+    case_a = PairedSuffixCase(
+        task_id="task_p2_unhashable_env",
+        task_description="Execute dataclass step.",
+        ground_truth="",
+        gold_answers=[],
+        prefix_steps=[],
+        deviation=DeviationPoint(step_index=1, trough_potential=0.0, pre_mean_potential=0.0, post_mean_potential=0.0),
+    )
+
+    updated_skill_a, accepted_deltas_a, _ = pipeline.optimize_step(
+        paired_cases=[case_a],
+        current_skill="# Initial Skill",
+        env_step_fn=env_a.step,
+        adapter=None,
+    )
+
+    assert case_a.teacher_success is True
+    assert len(accepted_deltas_a) == 1
+    assert "Follow unhashable dataclass execution." in updated_skill_a
+    assert env_a.actions == ["do_task"]
+
+    # ── Branch B: Callable mutable dataclass as env_step_fn directly ──
+    @dataclass
+    class CallableUnhashableStepEnv:
+        actions: list[str] = field(default_factory=list)
+
+        def __call__(self, action: str):
+            self.actions.append(action)
+            return "goal reached", True, 1.0
+
+    callable_env = CallableUnhashableStepEnv()
+    assert getattr(callable_env, "__hash__") is None
+
+    case_b = PairedSuffixCase(
+        task_id="task_p2_callable_unhashable",
+        task_description="Execute callable dataclass step.",
+        ground_truth="",
+        gold_answers=[],
+        prefix_steps=[],
+        deviation=DeviationPoint(step_index=1, trough_potential=0.0, pre_mean_potential=0.0, post_mean_potential=0.0),
+    )
+
+    updated_skill_b, accepted_deltas_b, _ = pipeline.optimize_step(
+        paired_cases=[case_b],
+        current_skill="# Initial Skill",
+        env_step_fn=callable_env,
+        adapter=None,
+    )
+
+    assert case_b.teacher_success is True
+    assert len(accepted_deltas_b) == 1
+    assert callable_env.actions == ["do_task"]
+
+    # ── Branch C: Mutable dataclass across retry with successful reset ──
+    @dataclass
+    class StatefulUnhashableResetEnv:
+        count: int = 0
+        actions: list[str] = field(default_factory=list)
+
+        def reset(self, attempt=1):
+            self.count = 0
+            return True
+
+        def step(self, action: str):
+            self.actions.append(action)
+            self.count += 1
+            if self.count == 1 and action == "wrong":
+                return "failed", True, 0.0
+            return "success after reset", True, 1.0
+
+    attempt_counter = 0
+
+    def mock_chat_dataclass_retry(system, user, stage="", **kw):
+        nonlocal attempt_counter
+        if stage == "teacher_continuation":
+            attempt_counter += 1
+            if attempt_counter == 1:
+                return "<think>Try wrong</think><action>wrong</action>", {}
+            else:
+                return "<think>Try right</think><action>right</action>", {}
+        elif stage == "contrast_analysis":
+            return json.dumps({
+                "student_mistake": "Wrong action",
+                "teacher_correction": "Right action",
+                "skill_gap": "Need right rule",
+                "evolution_direction": "Add right rule",
+            }), {}
+        elif stage == "delta_generation":
+            return json.dumps({
+                "action": "improve_skill",
+                "target_rule": "Retry Rule",
+                "content": "Reset and execute right action.",
+                "trigger_condition": "When retrying dataclass env",
+                "rationale": "Succeeds on attempt 2",
+            }), {}
+        elif stage == "regression_verification":
+            return json.dumps({
+                "no_regression_score": 0.95,
+                "generalizable_rule_score": 0.95,
+                "critique": "Solid update",
+            }), {}
+        return "{}", {}
+
+    monkeypatch.setattr(teacher_continuation, "chat_optimizer", mock_chat_dataclass_retry)
+    monkeypatch.setattr(delta_generator, "chat_optimizer", mock_chat_dataclass_retry)
+    monkeypatch.setattr(regression_verifier, "chat_optimizer", mock_chat_dataclass_retry)
+
+    env_c = StatefulUnhashableResetEnv()
+    pipeline_retry = SkillPivotPipeline(allow_simulated=False, teacher_max_steps=1)
+    pipeline_retry.teacher_engine.max_retries = 2
+
+    case_c = PairedSuffixCase(
+        task_id="task_p2_unhashable_retry_reset",
+        task_description="Execute dataclass retry with reset.",
+        ground_truth="",
+        gold_answers=[],
+        prefix_steps=[],
+        deviation=DeviationPoint(step_index=1, trough_potential=0.0, pre_mean_potential=0.0, post_mean_potential=0.0),
+    )
+
+    attempt_counter = 0
+    updated_skill_c, accepted_deltas_c, _ = pipeline_retry.optimize_step(
+        paired_cases=[case_c],
+        current_skill="# Initial Skill",
+        env_step_fn=env_c.step,
+        adapter=None,
+    )
+
+    assert case_c.teacher_success is True
+    assert len(accepted_deltas_c) == 1
+    assert "Reset and execute right action." in updated_skill_c
+    assert env_c.actions == ["wrong", "right"]
+
+    # ── Branch D: Mutable dataclass across retry without reset (rejected by gate 2) ──
+    @dataclass
+    class StatefulUnhashableNoResetEnv:
+        actions: list[str] = field(default_factory=list)
+
+        def step(self, action: str):
+            self.actions.append(action)
+            return "failed step", True, 0.0
+
+    env_d = StatefulUnhashableNoResetEnv()
+    case_d = PairedSuffixCase(
+        task_id="task_p2_unhashable_retry_no_reset",
+        task_description="Dataclass without reset should be rejected safely.",
+        ground_truth="",
+        gold_answers=[],
+        prefix_steps=[],
+        deviation=DeviationPoint(step_index=1, trough_potential=0.0, pre_mean_potential=0.0, post_mean_potential=0.0),
+    )
+
+    attempt_counter = 0
+    updated_skill_d, accepted_deltas_d, _ = pipeline_retry.optimize_step(
+        paired_cases=[case_d],
+        current_skill="# Initial Skill",
+        env_step_fn=env_d.step,
+        adapter=None,
+    )
+
+    assert case_d.teacher_success is False
+    assert len(accepted_deltas_d) == 0
+    assert updated_skill_d == "# Initial Skill"
+    assert env_d.actions == ["wrong"]
+    assert len(case_d.teacher_suffix) == 1
+    assert case_d.teacher_suffix[0].action == "wrong"
+
+
+
 
 
 

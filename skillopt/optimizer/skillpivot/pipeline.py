@@ -190,39 +190,48 @@ class SkillPivotPipeline:
                 if is_factory:
                     # 工厂函数抛出的业务异常直接向外抛出供引擎门控捕获，严禁 fallback 返回工厂本身
                     return env_step_fn(*factory_call_args)
-                elif adapter is not None and hasattr(adapter, "build_continuation_step_fn"):
+
+                # 保留显式 step 的优先级，避免 adapter 默认 hook 遮蔽真实 step 执行
+                if callable(env_step_fn):
+                    if attempt > 1:
+                        # 对于纯复用同一固定 env_step_fn 的状态化环境（既无独立 builder 亦非工厂），重试前若存在 reset 机制则必须成功重置
+                        # 若重置抛出异常或返回 False，将抛出 RuntimeError 触发构造/重置门控拦截，严禁沿用被污染环境
+                        has_reset_mechanism = False
+                        if adapter is not None and hasattr(adapter, "reset_continuation_env"):
+                            if getattr(type(adapter), "reset_continuation_env", None) is not EnvAdapter.reset_continuation_env:
+                                has_reset_mechanism = True
+                        if (hasattr(env_step_fn, "reset") and callable(env_step_fn.reset)) or \
+                           (hasattr(getattr(env_step_fn, "__self__", None), "reset") and callable(getattr(env_step_fn, "__self__").reset)):
+                            has_reset_mechanism = True
+
+                        if has_reset_mechanism:
+                            reset_res = _env_reset(attempt)
+                            if not reset_res:
+                                raise RuntimeError(f"Environment reset failed on attempt {attempt}")
+                    return env_step_fn
+
+                # 未显式提供 env_step_fn 时，由 adapter.build_continuation_step_fn 构建
+                if adapter is not None and hasattr(adapter, "build_continuation_step_fn"):
                     try:
-                        return adapter.build_continuation_step_fn(
+                        step_cand = adapter.build_continuation_step_fn(
                             case,
                             train_env=train_env,
                             attempt=attempt,
                             **kwargs,
                         )
+                        if step_cand is not None:
+                            return step_cand
                     except TypeError:
                         try:
-                            return adapter.build_continuation_step_fn(case, train_env=train_env)
+                            step_cand = adapter.build_continuation_step_fn(case, train_env=train_env)
+                            if step_cand is not None:
+                                return step_cand
                         except TypeError:
-                            return adapter.build_continuation_step_fn(case)
+                            step_cand = adapter.build_continuation_step_fn(case)
+                            if step_cand is not None:
+                                return step_cand
                     # 保留真实环境构造异常向外抛出，供 TeacherContinuationEngine 捕获并记录失败，严禁吞掉降级为纯答案验证
 
-                if attempt > 1 and callable(env_step_fn):
-                    # 对于纯复用同一固定 env_step_fn 的状态化环境（既无独立 builder 亦非工厂），重试前若存在 reset 机制则必须成功重置
-                    # 若重置抛出异常或返回 False，将抛出 RuntimeError 触发构造/重置门控拦截，严禁沿用被污染环境
-                    has_reset_mechanism = False
-                    if adapter is not None and hasattr(adapter, "reset_continuation_env"):
-                        if getattr(type(adapter), "reset_continuation_env", None) is not EnvAdapter.reset_continuation_env:
-                            has_reset_mechanism = True
-                    if (hasattr(env_step_fn, "reset") and callable(env_step_fn.reset)) or \
-                       (hasattr(getattr(env_step_fn, "__self__", None), "reset") and callable(getattr(env_step_fn, "__self__").reset)):
-                        has_reset_mechanism = True
-
-                    if has_reset_mechanism:
-                        reset_res = _env_reset(attempt)
-                        if not reset_res:
-                            raise RuntimeError(f"Environment reset failed on attempt {attempt}")
-
-                if callable(env_step_fn):
-                    return env_step_fn
                 return None
 
             # Resolve task-specific evaluator function
