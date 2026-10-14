@@ -2134,6 +2134,269 @@ def test_reset_failure_rejects_polluted_state_suffix_while_clean_builder_succeed
     assert "Perform complete open and collect sequence." in updated_skill_clean
 
 
+def test_skipped_attempts_persist_environment_pollution_across_three_or_more_retries(monkeypatch):
+    """Verify that when attempts are skipped (due to RESET_ERROR or ENVIRONMENT_ERROR),
+    the pollution record of a stateful environment that executed steps is NOT cleared.
+    Under the default max_retries=3 (and even max_retries=4), attempts 2 and 3 must both
+    be rejected if the same unreset environment is passed, preventing attempt 3 from
+    falsely succeeding on a polluted suffix.
+
+    Regression test for round 11 review P1 finding.
+    """
+    from skillopt.optimizer.skillpivot import delta_generator, regression_verifier, teacher_continuation
+    from skillopt.optimizer.skillpivot.pipeline import SkillPivotPipeline
+    from skillopt.types import DeviationPoint, PairedSuffixCase
+
+    class StatefulEnvWithoutReset:
+        def __init__(self):
+            self.door_open = False
+            self.actions_received = []
+
+        def step(self, action: str):
+            self.actions_received.append(action)
+            if action == "open":
+                self.door_open = True
+                return "Door opened", False, 0.0
+            elif action == "collect":
+                if self.door_open:
+                    return "Collected item behind open door!", True, 1.0
+                return "Door closed, cannot collect", True, 0.0
+            return "Unknown action", False, 0.0
+
+    attempt_counter = 0
+
+    def mock_chat_multi_retry(system, user, stage="", **kw):
+        nonlocal attempt_counter
+        if stage == "teacher_continuation":
+            attempt_counter += 1
+            if attempt_counter == 1:
+                return "<think>Open door</think><action>open</action>", {}
+            else:
+                return "<think>Collect item</think><action>collect</action>", {}
+        return "{}", {}
+
+    monkeypatch.setattr(teacher_continuation, "chat_optimizer", mock_chat_multi_retry)
+    monkeypatch.setattr(delta_generator, "chat_optimizer", mock_chat_multi_retry)
+    monkeypatch.setattr(regression_verifier, "chat_optimizer", mock_chat_multi_retry)
+
+    # 1. 默认 max_retries=3 场景
+    env_default_retries = StatefulEnvWithoutReset()
+    pipeline_3 = SkillPivotPipeline(allow_simulated=False, teacher_max_steps=1)
+    assert pipeline_3.teacher_engine.max_retries == 3
+
+    case_3 = PairedSuffixCase(
+        task_id="task_p1_multi_retry_default",
+        task_description="Open door then collect.",
+        ground_truth="",
+        gold_answers=[],
+        prefix_steps=[],
+        deviation=DeviationPoint(step_index=1, trough_potential=0.0, pre_mean_potential=0.0, post_mean_potential=0.0),
+    )
+
+    attempt_counter = 0
+    updated_skill_3, accepted_deltas_3, _ = pipeline_3.optimize_step(
+        paired_cases=[case_3],
+        current_skill="# Initial Skill",
+        env_step_fn=env_default_retries.step,
+        adapter=None,
+    )
+
+    # 断言：旧环境污染状态持续保留，attempt 2 与 attempt 3 均被门控拦截；
+    # collect 绝未被执行，更不能被误判为 teacher_success
+    assert case_3.teacher_success is False
+    assert len(accepted_deltas_3) == 0
+    assert updated_skill_3 == "# Initial Skill"
+    assert env_default_retries.actions_received == ["open"]
+
+    # 2. 4 次重试且中间穿插构造失败的复杂生命周期场景
+    env_4 = StatefulEnvWithoutReset()
+    pipeline_4 = SkillPivotPipeline(allow_simulated=False, teacher_max_steps=1)
+    pipeline_4.teacher_engine.max_retries = 4
+
+    builder_calls = []
+
+    def builder_with_crashes(attempt: int = 1):
+        builder_calls.append(attempt)
+        if attempt == 1:
+            return env_4.step
+        elif attempt == 2:
+            raise RuntimeError("transient builder network error")
+        elif attempt == 3:
+            return env_4.step  # 依然返回受污染的未 reset 环境
+        else:
+            return env_4.step
+
+    case_4 = PairedSuffixCase(
+        task_id="task_p1_multi_retry_with_builder_crash",
+        task_description="Open door then collect across builder crash.",
+        ground_truth="",
+        gold_answers=[],
+        prefix_steps=[],
+        deviation=DeviationPoint(step_index=1, trough_potential=0.0, pre_mean_potential=0.0, post_mean_potential=0.0),
+    )
+
+    attempt_counter = 0
+    updated_skill_4, accepted_deltas_4, _ = pipeline_4.optimize_step(
+        paired_cases=[case_4],
+        current_skill="# Initial Skill",
+        env_step_fn_builder=builder_with_crashes,
+        adapter=None,
+    )
+
+    assert case_4.teacher_success is False
+    assert len(accepted_deltas_4) == 0
+    assert updated_skill_4 == "# Initial Skill"
+    assert env_4.actions_received == ["open"]
+    assert builder_calls == [1, 2, 3, 4]
+
+
+def test_old_environment_reset_failure_does_not_reject_clean_independent_builder_retry(monkeypatch):
+    """Verify that when an old environment fails to reset (via exception or returning False),
+    an independent clean builder that returns a fresh, unpolluted environment succeeds
+    and produces a valid skill delta through the real SkillPivotPipeline.
+
+    Regression test for round 11 review P2 finding.
+    """
+    from skillopt.optimizer.skillpivot import delta_generator, regression_verifier, teacher_continuation
+    from skillopt.optimizer.skillpivot.pipeline import SkillPivotPipeline
+    from skillopt.types import DeviationPoint, PairedSuffixCase
+
+    class StatefulEnvWithCrashingReset:
+        def __init__(self, fail_with_exception=True):
+            self.fail_with_exception = fail_with_exception
+            self.actions = []
+
+        def reset(self, attempt=1):
+            if self.fail_with_exception:
+                raise RuntimeError("checkpoint store offline")
+            return False
+
+        def step(self, action: str):
+            self.actions.append(action)
+            return "Failed in old env", True, 0.0
+
+    class CleanNewEnv:
+        def __init__(self):
+            self.actions = []
+
+        def step(self, action: str):
+            self.actions.append(action)
+            return "Item successfully acquired in clean env", True, 1.0
+
+    attempt_counter = 0
+
+    def mock_chat_cross_retry(system, user, stage="", **kw):
+        nonlocal attempt_counter
+        if stage == "teacher_continuation":
+            attempt_counter += 1
+            return "<think>Execute action</think><action>fetch_item</action>", {}
+        elif stage == "contrast_analysis":
+            return json.dumps({
+                "student_mistake": "Failed to fetch item",
+                "teacher_correction": "Execute fetch_item cleanly",
+                "skill_gap": "Need clean fetch rule",
+                "evolution_direction": "Add fetch rule",
+            }), {}
+        elif stage == "delta_generation":
+            return json.dumps({
+                "action": "improve_skill",
+                "target_rule": "Clean Fetch",
+                "content": "Fetch item cleanly using updated environment handle.",
+                "trigger_condition": "When fetching items",
+                "rationale": "Succeeds via clean builder",
+            }), {}
+        elif stage == "regression_verification":
+            return json.dumps({
+                "no_regression_score": 0.98,
+                "generalizable_rule_score": 0.95,
+                "critique": "Valid improvement",
+            }), {}
+        return "{}", {}
+
+    monkeypatch.setattr(teacher_continuation, "chat_optimizer", mock_chat_cross_retry)
+    monkeypatch.setattr(delta_generator, "chat_optimizer", mock_chat_cross_retry)
+    monkeypatch.setattr(regression_verifier, "chat_optimizer", mock_chat_cross_retry)
+
+    # 场景 1: 旧环境 reset 抛出 RuntimeError，重试由独立 builder 提供全新干净环境
+    old_env_exc = StatefulEnvWithCrashingReset(fail_with_exception=True)
+    clean_envs_created = []
+
+    def cross_builder_exc(attempt: int = 1):
+        if attempt == 1:
+            return old_env_exc.step
+        new_env = CleanNewEnv()
+        clean_envs_created.append(new_env)
+        return new_env.step
+
+    pipeline_cross_1 = SkillPivotPipeline(allow_simulated=False, teacher_max_steps=1)
+    pipeline_cross_1.teacher_engine.max_retries = 3
+
+    case_cross_1 = PairedSuffixCase(
+        task_id="task_p2_cross_exc",
+        task_description="Old env reset raises error, clean builder recovers.",
+        ground_truth="",
+        gold_answers=[],
+        prefix_steps=[],
+        deviation=DeviationPoint(step_index=1, trough_potential=0.0, pre_mean_potential=0.0, post_mean_potential=0.0),
+    )
+
+    attempt_counter = 0
+    updated_skill_1, accepted_deltas_1, _ = pipeline_cross_1.optimize_step(
+        paired_cases=[case_cross_1],
+        current_skill="# Initial Skill",
+        env_step_fn=old_env_exc.step,
+        env_step_fn_builder=cross_builder_exc,
+        adapter=None,
+    )
+
+    assert case_cross_1.teacher_success is True
+    assert len(accepted_deltas_1) == 1
+    assert "Fetch item cleanly using updated environment handle." in updated_skill_1
+    assert old_env_exc.actions == ["fetch_item"]
+    assert len(clean_envs_created) == 1
+    assert clean_envs_created[0].actions == ["fetch_item"]
+
+    # 场景 2: 旧环境 reset 返回 False，重试由独立 builder 提供全新干净环境
+    old_env_false = StatefulEnvWithCrashingReset(fail_with_exception=False)
+    clean_envs_created_false = []
+
+    def cross_builder_false(attempt: int = 1):
+        if attempt == 1:
+            return old_env_false.step
+        new_env = CleanNewEnv()
+        clean_envs_created_false.append(new_env)
+        return new_env.step
+
+    pipeline_cross_2 = SkillPivotPipeline(allow_simulated=False, teacher_max_steps=1)
+    pipeline_cross_2.teacher_engine.max_retries = 3
+
+    case_cross_2 = PairedSuffixCase(
+        task_id="task_p2_cross_false",
+        task_description="Old env reset returns False, clean builder recovers.",
+        ground_truth="",
+        gold_answers=[],
+        prefix_steps=[],
+        deviation=DeviationPoint(step_index=1, trough_potential=0.0, pre_mean_potential=0.0, post_mean_potential=0.0),
+    )
+
+    attempt_counter = 0
+    updated_skill_2, accepted_deltas_2, _ = pipeline_cross_2.optimize_step(
+        paired_cases=[case_cross_2],
+        current_skill="# Initial Skill",
+        env_step_fn=old_env_false.step,
+        env_step_fn_builder=cross_builder_false,
+        adapter=None,
+    )
+
+    assert case_cross_2.teacher_success is True
+    assert len(accepted_deltas_2) == 1
+    assert "Fetch item cleanly using updated environment handle." in updated_skill_2
+    assert old_env_false.actions == ["fetch_item"]
+    assert len(clean_envs_created_false) == 1
+    assert clean_envs_created_false[0].actions == ["fetch_item"]
+
+
+
 
 
 

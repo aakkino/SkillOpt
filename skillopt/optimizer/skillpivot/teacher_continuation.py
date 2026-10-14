@@ -241,9 +241,9 @@ class TeacherContinuationEngine:
 
         t_star = case.deviation.step_index if case.deviation else len(case.prefix_steps) + 1
 
-        prev_active_env_step_fn = None
-        prev_env_instance = None
-        prev_attempt_executed_steps = False
+        polluted_step_fns: set[Any] = set()
+        polluted_instances: set[Any] = set()
+        last_executed_teacher_steps: list[TrajectoryStep] = []
 
         for attempt in range(1, self.max_retries + 1):
             teacher_steps: list[TrajectoryStep] = []
@@ -323,6 +323,10 @@ class TeacherContinuationEngine:
                             reset_error_message = str(e)
                             logger.warning(f"Task {case.task_id}: adapter.reset_continuation_env error on attempt {attempt}: {e}")
 
+                if did_reset:
+                    polluted_step_fns.clear()
+                    polluted_instances.clear()
+
             # Resolve / rebuild environment step function for this attempt
             active_env_step_fn = None
             env_construction_failed = False
@@ -359,7 +363,7 @@ class TeacherContinuationEngine:
             current_env_instance = getattr(active_env_step_fn, "__self__", None) if active_env_step_fn is not None else None
 
             # 3. In-situ reset on active step function if not already reset
-            if attempt > 1 and not did_reset and not reset_failed and active_env_step_fn is not None:
+            if attempt > 1 and not did_reset and active_env_step_fn is not None:
                 reset_fn = None
                 if hasattr(active_env_step_fn, "reset") and callable(active_env_step_fn.reset):
                     reset_fn = active_env_step_fn.reset
@@ -371,6 +375,9 @@ class TeacherContinuationEngine:
                         res = reset_fn(attempt)
                         if res is not False:
                             did_reset = True
+                            polluted_step_fns.discard(active_env_step_fn)
+                            if current_env_instance is not None:
+                                polluted_instances.discard(current_env_instance)
                         else:
                             reset_failed = True
                             reset_error_message = "active_env_step_fn reset returned False"
@@ -379,6 +386,9 @@ class TeacherContinuationEngine:
                             res = reset_fn()
                             if res is not False:
                                 did_reset = True
+                                polluted_step_fns.discard(active_env_step_fn)
+                                if current_env_instance is not None:
+                                    polluted_instances.discard(current_env_instance)
                             else:
                                 reset_failed = True
                                 reset_error_message = "active_env_step_fn reset returned False"
@@ -405,22 +415,19 @@ class TeacherContinuationEngine:
                     execution_status=0,
                 )
                 teacher_steps.append(step_record)
-                prev_active_env_step_fn = active_env_step_fn
-                prev_env_instance = current_env_instance
-                prev_attempt_executed_steps = False
                 continue
 
             # ── Attempt 状态门控 2: 环境重置失败 / 污染状态复用门控 ──
             if attempt > 1:
-                is_same_env = False
+                is_current_env_polluted = False
                 if active_env_step_fn is not None:
-                    if prev_active_env_step_fn is not None and active_env_step_fn is prev_active_env_step_fn:
-                        is_same_env = True
-                    elif current_env_instance is not None and prev_env_instance is not None and current_env_instance is prev_env_instance:
-                        is_same_env = True
+                    if active_env_step_fn in polluted_step_fns:
+                        is_current_env_polluted = True
+                    elif current_env_instance is not None and current_env_instance in polluted_instances:
+                        is_current_env_polluted = True
 
-                # 若 reset 明确失败，或沿用了上一轮执行过 step 却未成功 reset 的环境实例，则拒绝继续该 attempt
-                if reset_failed or (is_same_env and prev_attempt_executed_steps and not did_reset):
+                # 若当前环境属于已被历史动作污染的环境，且未成功 reset（或 reset 失败），则拒绝继续该 attempt
+                if is_current_env_polluted and (not did_reset or reset_failed):
                     err_msg = reset_error_message or "stateful environment not reset from previous attempt"
                     obs = f"Environment reset failed: {err_msg}"
                     step_record = TrajectoryStep(
@@ -434,9 +441,6 @@ class TeacherContinuationEngine:
                         execution_status=0,
                     )
                     teacher_steps.append(step_record)
-                    prev_active_env_step_fn = active_env_step_fn
-                    prev_env_instance = current_env_instance
-                    prev_attempt_executed_steps = False
                     continue
 
             attempt_executed_steps = False
@@ -572,9 +576,12 @@ class TeacherContinuationEngine:
                     f"[{hint}]"
                 )
 
-            prev_active_env_step_fn = active_env_step_fn
-            prev_env_instance = current_env_instance
-            prev_attempt_executed_steps = attempt_executed_steps
+            if attempt_executed_steps:
+                if active_env_step_fn is not None:
+                    polluted_step_fns.add(active_env_step_fn)
+                if current_env_instance is not None:
+                    polluted_instances.add(current_env_instance)
+                last_executed_teacher_steps = list(teacher_steps)
 
             if success:
                 case.teacher_suffix = teacher_steps
@@ -582,6 +589,6 @@ class TeacherContinuationEngine:
                 return case
 
         # Failed after max_retries
-        case.teacher_suffix = teacher_steps
+        case.teacher_suffix = last_executed_teacher_steps or teacher_steps
         case.teacher_success = False
         return case
