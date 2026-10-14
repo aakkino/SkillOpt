@@ -1826,6 +1826,314 @@ def test_pipeline_stateful_bound_env_step_reset_retry_without_adapter(monkeypatc
     assert "Always choose correct action." in updated_skill_noop
 
 
+# ── 18. Round 10 Regression: Tool Step Execution Exception Gating ─────────────
+
+
+def test_tool_execution_exception_rejected_in_pipeline_even_with_matching_answer(monkeypatch):
+    """Verify that when active_env_step_fn raises an execution exception (e.g. RuntimeError),
+    the attempt is marked as failed and is NEVER accepted via answer matching even if the
+    teacher outputs a matching gold answer. Delta generation and skill update must be skipped.
+
+    Regression test for round 10 review P1 finding.
+    """
+    from skillopt.optimizer.skillpivot import delta_generator, regression_verifier, teacher_continuation
+    from skillopt.optimizer.skillpivot.pipeline import SkillPivotPipeline
+    from skillopt.types import DeviationPoint, PairedSuffixCase
+
+    class ToolEnvWithReset:
+        def __init__(self):
+            self.reset_calls = []
+
+        def reset(self, attempt=1):
+            self.reset_calls.append(attempt)
+
+        def step(self, action: str):
+            raise RuntimeError("tool server offline")
+
+    def mock_chat_step_error(system, user, stage="", **kw):
+        if stage == "teacher_continuation":
+            return "<think>Direct answer</think><action>FINISH: 4</action>", {}
+        return "{}", {}
+
+    monkeypatch.setattr(teacher_continuation, "chat_optimizer", mock_chat_step_error)
+    monkeypatch.setattr(delta_generator, "chat_optimizer", mock_chat_step_error)
+    monkeypatch.setattr(regression_verifier, "chat_optimizer", mock_chat_step_error)
+
+    pipeline = SkillPivotPipeline(allow_simulated=False, teacher_max_steps=3)
+    pipeline.teacher_engine.max_retries = 2
+
+    case = PairedSuffixCase(
+        task_id="task_tool_exec_error",
+        task_description="Execute tool to obtain answer.",
+        ground_truth="4",
+        gold_answers=["4"],
+        prefix_steps=[],
+        deviation=DeviationPoint(step_index=1, trough_potential=0.0, pre_mean_potential=0.0, post_mean_potential=0.0),
+    )
+
+    env = ToolEnvWithReset()
+    updated_skill, accepted_deltas, gate_results = pipeline.optimize_step(
+        paired_cases=[case],
+        current_skill="# Initial Skill",
+        env_step_fn=env.step,
+        adapter=None,
+    )
+
+    # Verification: teacher must NOT succeed; execution error observation recorded; no delta generated
+    assert case.teacher_success is False
+    assert len(accepted_deltas) == 0
+    assert len(gate_results) == 0
+    assert updated_skill == "# Initial Skill"
+    assert len(case.teacher_suffix) >= 1
+    last_step = case.teacher_suffix[-1]
+    assert "Execution error: tool server offline" in last_step.observation
+    assert last_step.reward == 0.0
+    assert last_step.execution_status == 0
+
+
+# ── 19. Round 10 Regression: Callable Factory Exception Gating ────────────────
+
+
+def test_callable_factory_exception_rejected_without_fallback_in_pipeline(monkeypatch):
+    """Verify that when a callable factory `def build(case, attempt)` raises an exception,
+    the pipeline does NOT fallback to returning the factory itself (which would cause a TypeError
+    and subsequent false-positive answer matching). Instead, the construction failure is gated
+    and delta generation is skipped.
+
+    Regression test for round 10 review P1 finding.
+    """
+    from skillopt.optimizer.skillpivot import delta_generator, regression_verifier, teacher_continuation
+    from skillopt.optimizer.skillpivot.pipeline import SkillPivotPipeline
+    from skillopt.types import DeviationPoint, PairedSuffixCase
+
+    def failing_factory(case, attempt):
+        raise RuntimeError("database connection lost")
+
+    def mock_chat_factory_error(system, user, stage="", **kw):
+        if stage == "teacher_continuation":
+            return "<think>Direct answer</think><action>FINISH: 4</action>", {}
+        return "{}", {}
+
+    monkeypatch.setattr(teacher_continuation, "chat_optimizer", mock_chat_factory_error)
+    monkeypatch.setattr(delta_generator, "chat_optimizer", mock_chat_factory_error)
+    monkeypatch.setattr(regression_verifier, "chat_optimizer", mock_chat_factory_error)
+
+    pipeline = SkillPivotPipeline(allow_simulated=False, teacher_max_steps=3)
+    pipeline.teacher_engine.max_retries = 2
+
+    case = PairedSuffixCase(
+        task_id="task_factory_error",
+        task_description="Build tool step fn via factory.",
+        ground_truth="4",
+        gold_answers=["4"],
+        prefix_steps=[],
+        deviation=DeviationPoint(step_index=1, trough_potential=0.0, pre_mean_potential=0.0, post_mean_potential=0.0),
+    )
+
+    updated_skill, accepted_deltas, _ = pipeline.optimize_step(
+        paired_cases=[case],
+        current_skill="# Initial Skill",
+        env_step_fn=failing_factory,
+        adapter=None,
+    )
+
+    # Verification: teacher must NOT succeed; ENVIRONMENT_ERROR recorded; no delta generated
+    assert case.teacher_success is False
+    assert len(accepted_deltas) == 0
+    assert updated_skill == "# Initial Skill"
+    assert len(case.teacher_suffix) == 1
+    assert case.teacher_suffix[0].action == "ENVIRONMENT_ERROR"
+    assert "database connection lost" in case.teacher_suffix[0].observation
+
+
+# ── 20. Round 10 Regression: Reset Failure & State Pollution Suffix Rejection ──
+
+
+def test_reset_failure_rejects_polluted_state_suffix_while_clean_builder_succeeds(monkeypatch):
+    """Verify that when a stateful environment fails reset on attempt > 1 (raising an exception
+    or returning False), the engine rejects the retry attempt rather than continuing with
+    polluted state changes from attempt 1.
+
+    Conversely, a clean builder that independently restores/creates state succeeds on retry.
+
+    Regression test for round 10 review P1 finding.
+    """
+    from skillopt.optimizer.skillpivot import delta_generator, regression_verifier, teacher_continuation
+    from skillopt.optimizer.skillpivot.pipeline import SkillPivotPipeline
+    from skillopt.types import DeviationPoint, PairedSuffixCase
+
+    # ── Part A: Stateful environment with failing reset (raises RuntimeError) ──
+    class StatefulEnvWithFailingReset:
+        def __init__(self, fail_with_exception=True):
+            self.door_open = False
+            self.fail_with_exception = fail_with_exception
+            self.actions_received = []
+
+        def reset(self, attempt=1):
+            if self.fail_with_exception:
+                raise RuntimeError("restore checkpoint failed")
+            return False
+
+        def step(self, action: str):
+            self.actions_received.append(action)
+            if action == "open":
+                self.door_open = True
+                return "Door opened", False, 0.0
+            elif action == "collect":
+                if self.door_open:
+                    return "Collected item behind open door!", True, 1.0
+                return "Door closed, cannot collect", True, 0.0
+            return "Unknown action", False, 0.0
+
+    attempt_counter = 0
+
+    def mock_chat_two_step(system, user, stage="", **kw):
+        nonlocal attempt_counter
+        if stage == "teacher_continuation":
+            if attempt_counter == 0:
+                attempt_counter += 1
+                return "<think>Open the door</think><action>open</action>", {}
+            else:
+                attempt_counter += 1
+                return "<think>Collect item</think><action>collect</action>", {}
+        return "{}", {}
+
+    monkeypatch.setattr(teacher_continuation, "chat_optimizer", mock_chat_two_step)
+    monkeypatch.setattr(delta_generator, "chat_optimizer", mock_chat_two_step)
+    monkeypatch.setattr(regression_verifier, "chat_optimizer", mock_chat_two_step)
+
+    # Subcase A1: reset raises RuntimeError
+    env_fail_exc = StatefulEnvWithFailingReset(fail_with_exception=True)
+    pipeline = SkillPivotPipeline(allow_simulated=False, teacher_max_steps=1)
+    pipeline.teacher_engine.max_retries = 2
+
+    case_fail_exc = PairedSuffixCase(
+        task_id="task_reset_fail_exc",
+        task_description="Open door then collect.",
+        ground_truth="",
+        gold_answers=[],
+        prefix_steps=[],
+        deviation=DeviationPoint(step_index=1, trough_potential=0.0, pre_mean_potential=0.0, post_mean_potential=0.0),
+    )
+
+    attempt_counter = 0
+    updated_skill_exc, accepted_deltas_exc, _ = pipeline.optimize_step(
+        paired_cases=[case_fail_exc],
+        current_skill="# Initial Skill",
+        env_step_fn=env_fail_exc.step,
+        adapter=None,
+    )
+
+    # Must NOT accept collect as a standalone suffix relying on attempt 1 open side-effect
+    assert case_fail_exc.teacher_success is False
+    assert len(accepted_deltas_exc) == 0
+    assert updated_skill_exc == "# Initial Skill"
+    assert env_fail_exc.actions_received == ["open"]
+
+    # Subcase A2: reset returns False
+    env_fail_false = StatefulEnvWithFailingReset(fail_with_exception=False)
+    case_fail_false = PairedSuffixCase(
+        task_id="task_reset_fail_false",
+        task_description="Open door then collect.",
+        ground_truth="",
+        gold_answers=[],
+        prefix_steps=[],
+        deviation=DeviationPoint(step_index=1, trough_potential=0.0, pre_mean_potential=0.0, post_mean_potential=0.0),
+    )
+
+    attempt_counter = 0
+    updated_skill_false, accepted_deltas_false, _ = pipeline.optimize_step(
+        paired_cases=[case_fail_false],
+        current_skill="# Initial Skill",
+        env_step_fn=env_fail_false.step,
+        adapter=None,
+    )
+
+    assert case_fail_false.teacher_success is False
+    assert len(accepted_deltas_false) == 0
+    assert updated_skill_false == "# Initial Skill"
+    assert env_fail_false.actions_received == ["open"]
+
+    # ── Part B: Independent Clean Builder Reconstructing State: Must Succeed ──
+    class CleanStatefulEnv:
+        def __init__(self):
+            self.door_open = False
+
+        def step(self, action: str):
+            if action == "wrong":
+                return "Wrong action", True, 0.0
+            elif action == "open and collect":
+                return "Completed in single step", True, 1.0
+            return "Noop", False, 0.0
+
+    def clean_builder(attempt: int = 1):
+        env = CleanStatefulEnv()
+        return env.step
+
+    attempt_counter = 0
+
+    def mock_chat_clean_builder(system, user, stage="", **kw):
+        nonlocal attempt_counter
+        if stage == "teacher_continuation":
+            if attempt_counter == 0:
+                attempt_counter += 1
+                return "<think>Try wrong</think><action>wrong</action>", {}
+            else:
+                attempt_counter += 1
+                return "<think>Try full sequence</think><action>open and collect</action>", {}
+        elif stage == "contrast_analysis":
+            return json.dumps({
+                "student_mistake": "Wrong step",
+                "teacher_correction": "Open and collect",
+                "skill_gap": "Need complete rule",
+                "evolution_direction": "Add rule",
+            }), {}
+        elif stage == "delta_generation":
+            return json.dumps({
+                "action": "improve_skill",
+                "target_rule": "Complete Sequence",
+                "content": "Perform complete open and collect sequence.",
+                "trigger_condition": "When collecting",
+                "rationale": "Succeeds cleanly",
+            }), {}
+        elif stage == "regression_verification":
+            return json.dumps({
+                "no_regression_score": 0.95,
+                "generalizable_rule_score": 0.95,
+                "critique": "Solid update",
+            }), {}
+        return "{}", {}
+
+    monkeypatch.setattr(teacher_continuation, "chat_optimizer", mock_chat_clean_builder)
+    monkeypatch.setattr(delta_generator, "chat_optimizer", mock_chat_clean_builder)
+    monkeypatch.setattr(regression_verifier, "chat_optimizer", mock_chat_clean_builder)
+
+    pipeline_clean = SkillPivotPipeline(allow_simulated=False, teacher_max_steps=2)
+    pipeline_clean.teacher_engine.max_retries = 2
+
+    case_clean = PairedSuffixCase(
+        task_id="task_clean_builder_retry",
+        task_description="Clean builder retry test.",
+        ground_truth="",
+        gold_answers=[],
+        prefix_steps=[],
+        deviation=DeviationPoint(step_index=1, trough_potential=0.0, pre_mean_potential=0.0, post_mean_potential=0.0),
+    )
+
+    attempt_counter = 0
+    updated_skill_clean, accepted_deltas_clean, _ = pipeline_clean.optimize_step(
+        paired_cases=[case_clean],
+        current_skill="# Initial Skill",
+        env_step_fn_builder=clean_builder,
+        adapter=None,
+    )
+
+    # Verification: clean builder retry succeeds and generates delta
+    assert case_clean.teacher_success is True
+    assert len(accepted_deltas_clean) == 1
+    assert "Perform complete open and collect sequence." in updated_skill_clean
+
+
 
 
 

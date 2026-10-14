@@ -241,13 +241,20 @@ class TeacherContinuationEngine:
 
         t_star = case.deviation.step_index if case.deviation else len(case.prefix_steps) + 1
 
+        prev_active_env_step_fn = None
+        prev_env_instance = None
+        prev_attempt_executed_steps = False
+
         for attempt in range(1, self.max_retries + 1):
             teacher_steps: list[TrajectoryStep] = []
             conversation_history = base_user_prompt
             success = False
 
-            # Reset stateful environment before retry attempts (attempt > 1)
+            # Reset tracking for stateful environments across retries
             did_reset = False
+            reset_failed = False
+            reset_error_message = ""
+
             if attempt > 1:
                 # 1. Custom env_reset_fn
                 if env_reset_fn is not None:
@@ -255,18 +262,28 @@ class TeacherContinuationEngine:
                         res = env_reset_fn(attempt)
                         if res is not False:
                             did_reset = True
+                        else:
+                            reset_failed = True
+                            reset_error_message = "env_reset_fn returned False"
                     except TypeError:
                         try:
                             res = env_reset_fn()
                             if res is not False:
                                 did_reset = True
+                            else:
+                                reset_failed = True
+                                reset_error_message = "env_reset_fn returned False"
                         except Exception as e:
+                            reset_failed = True
+                            reset_error_message = str(e)
                             logger.warning(f"Task {case.task_id}: env_reset_fn error on attempt {attempt}: {e}")
                     except Exception as e:
+                        reset_failed = True
+                        reset_error_message = str(e)
                         logger.warning(f"Task {case.task_id}: env_reset_fn error on attempt {attempt}: {e}")
 
                 # 2. Adapter reset_continuation_env hook
-                if not did_reset and adapter is not None and hasattr(adapter, "reset_continuation_env"):
+                if not did_reset and not reset_failed and adapter is not None and hasattr(adapter, "reset_continuation_env"):
                     from skillopt.envs.base import EnvAdapter
                     is_base_noop = getattr(type(adapter), "reset_continuation_env", None) is EnvAdapter.reset_continuation_env
                     if not is_base_noop:
@@ -274,21 +291,36 @@ class TeacherContinuationEngine:
                             res = adapter.reset_continuation_env(case, train_env=train_env, attempt=attempt)
                             if res is not False:
                                 did_reset = True
+                            else:
+                                reset_failed = True
+                                reset_error_message = "adapter.reset_continuation_env returned False"
                         except TypeError:
                             try:
                                 res = adapter.reset_continuation_env(case, train_env=train_env)
                                 if res is not False:
                                     did_reset = True
+                                else:
+                                    reset_failed = True
+                                    reset_error_message = "adapter.reset_continuation_env returned False"
                             except TypeError:
                                 try:
                                     res = adapter.reset_continuation_env(case)
                                     if res is not False:
                                         did_reset = True
+                                    else:
+                                        reset_failed = True
+                                        reset_error_message = "adapter.reset_continuation_env returned False"
                                 except Exception as e:
+                                    reset_failed = True
+                                    reset_error_message = str(e)
                                     logger.warning(f"Task {case.task_id}: adapter.reset_continuation_env error on attempt {attempt}: {e}")
                             except Exception as e:
+                                reset_failed = True
+                                reset_error_message = str(e)
                                 logger.warning(f"Task {case.task_id}: adapter.reset_continuation_env error on attempt {attempt}: {e}")
                         except Exception as e:
+                            reset_failed = True
+                            reset_error_message = str(e)
                             logger.warning(f"Task {case.task_id}: adapter.reset_continuation_env error on attempt {attempt}: {e}")
 
             # Resolve / rebuild environment step function for this attempt
@@ -324,8 +356,10 @@ class TeacherContinuationEngine:
             elif env_step_fn is not None:
                 active_env_step_fn = env_step_fn
 
+            current_env_instance = getattr(active_env_step_fn, "__self__", None) if active_env_step_fn is not None else None
+
             # 3. In-situ reset on active step function if not already reset
-            if attempt > 1 and not did_reset and active_env_step_fn is not None:
+            if attempt > 1 and not did_reset and not reset_failed and active_env_step_fn is not None:
                 reset_fn = None
                 if hasattr(active_env_step_fn, "reset") and callable(active_env_step_fn.reset):
                     reset_fn = active_env_step_fn.reset
@@ -337,16 +371,27 @@ class TeacherContinuationEngine:
                         res = reset_fn(attempt)
                         if res is not False:
                             did_reset = True
+                        else:
+                            reset_failed = True
+                            reset_error_message = "active_env_step_fn reset returned False"
                     except TypeError:
                         try:
                             res = reset_fn()
                             if res is not False:
                                 did_reset = True
+                            else:
+                                reset_failed = True
+                                reset_error_message = "active_env_step_fn reset returned False"
                         except Exception as e:
+                            reset_failed = True
+                            reset_error_message = str(e)
                             logger.warning(f"Task {case.task_id}: active_env_step_fn reset error on attempt {attempt}: {e}")
                     except Exception as e:
+                        reset_failed = True
+                        reset_error_message = str(e)
                         logger.warning(f"Task {case.task_id}: active_env_step_fn reset error on attempt {attempt}: {e}")
 
+            # ── Attempt 状态门控 1: 环境构造失败门控 ──
             if env_construction_failed:
                 obs = f"Environment construction failed: {env_error_message}"
                 step_record = TrajectoryStep(
@@ -360,9 +405,43 @@ class TeacherContinuationEngine:
                     execution_status=0,
                 )
                 teacher_steps.append(step_record)
+                prev_active_env_step_fn = active_env_step_fn
+                prev_env_instance = current_env_instance
+                prev_attempt_executed_steps = False
                 continue
 
+            # ── Attempt 状态门控 2: 环境重置失败 / 污染状态复用门控 ──
+            if attempt > 1:
+                is_same_env = False
+                if active_env_step_fn is not None:
+                    if prev_active_env_step_fn is not None and active_env_step_fn is prev_active_env_step_fn:
+                        is_same_env = True
+                    elif current_env_instance is not None and prev_env_instance is not None and current_env_instance is prev_env_instance:
+                        is_same_env = True
+
+                # 若 reset 明确失败，或沿用了上一轮执行过 step 却未成功 reset 的环境实例，则拒绝继续该 attempt
+                if reset_failed or (is_same_env and prev_attempt_executed_steps and not did_reset):
+                    err_msg = reset_error_message or "stateful environment not reset from previous attempt"
+                    obs = f"Environment reset failed: {err_msg}"
+                    step_record = TrajectoryStep(
+                        step=t_star,
+                        action="RESET_ERROR",
+                        observation=obs,
+                        reasoning="",
+                        raw_model_response="",
+                        reward=0.0,
+                        done=True,
+                        execution_status=0,
+                    )
+                    teacher_steps.append(step_record)
+                    prev_active_env_step_fn = active_env_step_fn
+                    prev_env_instance = current_env_instance
+                    prev_attempt_executed_steps = False
+                    continue
+
+            attempt_executed_steps = False
             for step_offset in range(self.max_steps):
+                attempt_executed_steps = True
                 current_step_num = t_star + step_offset
 
                 # Call Teacher Model
@@ -384,6 +463,7 @@ class TeacherContinuationEngine:
                 )
 
                 step_success = False
+                execution_failed = False
 
                 if active_env_step_fn is not None:
                     try:
@@ -394,31 +474,37 @@ class TeacherContinuationEngine:
                         done = True
                         reward = 0.0
                         exec_st = 0
+                        execution_failed = True
 
-                    # Respect environment terminal status; do not override done=False on teacher FINISH
-                    cand_ans = extract_final_answer(action) or extract_final_answer(raw_response) or obs
-                    has_explicit_ans = bool(extract_final_answer(action) or extract_final_answer(raw_response))
+                    # ── Attempt 状态门控 3: 工具执行失败门控 ──
+                    # 发生明确执行异常时禁止进入答案匹配，严禁将包含 Execution error 的步骤误判为成功
+                    if not execution_failed:
+                        # Respect environment terminal status; do not override done=False on teacher FINISH
+                        cand_ans = extract_final_answer(action) or extract_final_answer(raw_response) or obs
+                        has_explicit_ans = bool(extract_final_answer(action) or extract_final_answer(raw_response))
 
-                    # Only verify task success when episode is genuinely done
-                    if done:
-                        if reward > self.success_reward_threshold:
-                            # Environment explicitly reported terminal success
-                            if evaluator_fn is not None and target_gts and has_explicit_ans:
-                                step_success = bool(evaluator_fn(cand_ans, target_gts))
-                            elif target_gts and has_explicit_ans:
-                                step_success = bool(default_verify_answer(cand_ans, target_gts))
+                        # Only verify task success when episode is genuinely done
+                        if done:
+                            if reward > self.success_reward_threshold:
+                                # Environment explicitly reported terminal success
+                                if evaluator_fn is not None and target_gts and has_explicit_ans:
+                                    step_success = bool(evaluator_fn(cand_ans, target_gts))
+                                elif target_gts and has_explicit_ans:
+                                    step_success = bool(default_verify_answer(cand_ans, target_gts))
+                                else:
+                                    step_success = True
                             else:
-                                step_success = True
+                                # Environment did not give positive reward; verify via explicit evaluator or gold answer
+                                if evaluator_fn is not None and target_gts:
+                                    step_success = bool(evaluator_fn(cand_ans, target_gts))
+                                elif target_gts:
+                                    step_success = bool(default_verify_answer(cand_ans, target_gts))
+                                else:
+                                    step_success = False
                         else:
-                            # Environment did not give positive reward; verify via explicit evaluator or gold answer
-                            if evaluator_fn is not None and target_gts:
-                                step_success = bool(evaluator_fn(cand_ans, target_gts))
-                            elif target_gts:
-                                step_success = bool(default_verify_answer(cand_ans, target_gts))
-                            else:
-                                step_success = False
+                            # Intermediate steps with progress/shaping reward (done=False) do NOT count as task success
+                            step_success = False
                     else:
-                        # Intermediate steps with progress/shaping reward (done=False) do NOT count as task success
                         step_success = False
                 elif has_verifiable_target:
                     # Verifiable through ground_truth / evaluator without env_step_fn
@@ -485,6 +571,10 @@ class TeacherContinuationEngine:
                     f"[Step {current_step_num} Observation] {obs}\n"
                     f"[{hint}]"
                 )
+
+            prev_active_env_step_fn = active_env_step_fn
+            prev_env_instance = current_env_instance
+            prev_attempt_executed_steps = attempt_executed_steps
 
             if success:
                 case.teacher_suffix = teacher_steps
