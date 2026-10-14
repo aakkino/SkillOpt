@@ -83,6 +83,113 @@ from skillopt.optimizer.update_modes import (
     short_item_summary,
 )
 from skillopt.utils import compute_score, skill_hash
+from skillopt.deviation_detector import DeviationDetector, get_embedding_provider
+from skillopt.optimizer.skillpivot import SkillPivotPipeline
+
+
+# ── SkillPivot Integration Runner ────────────────────────────────────────
+
+def run_skillpivot_reflect_step(
+    rollout_results: list[dict],
+    current_skill: str,
+    prediction_dir: str,
+    cfg: dict,
+    env_step_fn: Any = None,
+    embedding_provider: Any = None,
+    pipeline: Any = None,
+) -> list[dict]:
+    """Execute SkillPivot fine-grained deviation detection, teacher continuation,
+    paired suffix contrast, and regression gating.
+
+    Returns:
+        List of raw patch dictionaries compatible with the SkillOpt pipeline.
+    """
+    failures = [
+        r for r in rollout_results
+        if not r.get("hard") or float(r.get("hard", 0)) < 1e-9
+    ]
+    if not failures:
+        return []
+
+    # Configure embedding provider & deviation detector
+    if embedding_provider is None:
+        emb_backend = cfg.get("skillpivot_embedding_backend", os.environ.get("EMBEDDING_BACKEND", "local"))
+        emb_model = cfg.get("skillpivot_embedding_model")
+        embedding_provider = get_embedding_provider(backend=emb_backend, model=emb_model)
+
+    w_exec = float(cfg.get("skillpivot_w_exec", 0.4))
+    w_prog = float(cfg.get("skillpivot_w_prog", 0.4))
+    w_div = float(cfg.get("skillpivot_w_div", 0.2))
+    gate_thresh = float(cfg.get("skillpivot_gate_threshold", 0.5))
+
+    detector = DeviationDetector(
+        embedding_provider=embedding_provider,
+        w_exec=w_exec,
+        w_prog=w_prog,
+        w_div=w_div,
+    )
+
+    # 1. Slice failed trajectories into PairedSuffixCase objects
+    paired_cases = []
+    for item in failures:
+        tid = str(item.get("id"))
+        conv_path = os.path.join(prediction_dir, tid, "conversation.json")
+        if not os.path.exists(conv_path):
+            continue
+        try:
+            with open(conv_path, "r", encoding="utf-8") as f:
+                conv = json.load(f)
+        except Exception:
+            continue
+        if not conv:
+            continue
+
+        gt = str(item.get("reference_text") or item.get("ground_truth") or "")
+        case = detector.slice_trajectory(
+            task_id=tid,
+            conversation=conv,
+            ground_truth=gt,
+            task_type=str(item.get("task_type") or item.get("instruction_type") or ""),
+            task_description=str(item.get("task_description") or item.get("instruction") or item.get("question") or ""),
+            skill_name="active_skill",
+            skill_content=current_skill,
+        )
+        paired_cases.append(case)
+
+    if not paired_cases:
+        return []
+
+    # 2. Run SkillPivot Pipeline (Teacher Continuation -> Contrast -> Verifier Gate)
+    if pipeline is None:
+        pipeline = SkillPivotPipeline(gate_threshold=gate_thresh)
+    _, accepted_deltas, gate_results = pipeline.optimize_step(
+        paired_cases=paired_cases,
+        current_skill=current_skill,
+        env_step_fn=env_step_fn,
+    )
+
+    # 3. Convert accepted deltas to raw_patches compatible with trainer downstream
+    raw_patches = []
+    for delta in accepted_deltas:
+        raw_patch = {
+            "patch": {
+                "reasoning": f"SkillPivot [{delta.action}] rule={delta.target_rule}: {delta.rationale}",
+                "edits": [
+                    {
+                        "op": "append",
+                        "content": delta.content,
+                        "target": delta.target_rule,
+                        "source_type": "failure",
+                    }
+                ],
+            },
+            "source_type": "failure",
+            "batch_size": len(failures),
+        }
+        raw_patches.append(raw_patch)
+
+    return raw_patches
+
 
 # ── Skill-aware reflection: appendix flush ───────────────────────────────────
 
@@ -1277,13 +1384,21 @@ class ReflACTTrainer:
                     # Build step context from buffer
                     step_buffer_context = _format_step_buffer(step_buffer)
 
-                    raw_patches = adapter.reflect(
-                        rollout_results, current_skill, batch_dir,
-                        prediction_dir=pred_dir, patches_dir=patches_dir,
-                        random_seed=batch_seed,
-                        step_buffer_context=step_buffer_context,
-                        meta_skill_context=active_meta_skill,
-                    )
+                    if str(cfg.get("optimizer_type", "skillopt")).strip().lower() == "skillpivot":
+                        raw_patches = run_skillpivot_reflect_step(
+                            rollout_results=rollout_results,
+                            current_skill=current_skill,
+                            prediction_dir=pred_dir,
+                            cfg=cfg,
+                        )
+                    else:
+                        raw_patches = adapter.reflect(
+                            rollout_results, current_skill, batch_dir,
+                            prediction_dir=pred_dir, patches_dir=patches_dir,
+                            random_seed=batch_seed,
+                            step_buffer_context=step_buffer_context,
+                            meta_skill_context=active_meta_skill,
+                        )
                     failure_patches, success_patches = _normalise_patches(
                         raw_patches,
                         update_mode=update_mode,

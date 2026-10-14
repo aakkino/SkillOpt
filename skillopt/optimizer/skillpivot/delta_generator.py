@@ -92,11 +92,19 @@ class DeltaGenerator:
 
     def __init__(
         self,
-        chat_fn: Callable[..., tuple[str, dict]] = chat_optimizer,
+        chat_fn: Callable[..., tuple[str, dict]] | None = None,
         max_completion_tokens: int = 4096,
     ):
-        self.chat_fn = chat_fn
+        self._chat_fn = chat_fn
         self.max_completion_tokens = max_completion_tokens
+
+    @property
+    def chat_fn(self) -> Callable[..., tuple[str, dict]]:
+        return self._chat_fn or chat_optimizer
+
+    @chat_fn.setter
+    def chat_fn(self, fn: Callable[..., tuple[str, dict]] | None) -> None:
+        self._chat_fn = fn
 
     def summarize_contrast(self, case: PairedSuffixCase) -> dict[str, str]:
         """Phase 1: Summarize behavioral difference between student and teacher."""

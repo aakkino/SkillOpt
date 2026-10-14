@@ -117,7 +117,7 @@ class TeacherContinuationEngine:
         self,
         case: PairedSuffixCase,
         env_step_fn: Callable[[str], tuple[str, bool, float]] | None = None,
-        chat_fn: Callable[..., tuple[str, dict]] = chat_optimizer,
+        chat_fn: Callable[..., tuple[str, dict]] | None = None,
     ) -> PairedSuffixCase:
         """Execute teacher continuation from t* for up to max_steps turns.
 
@@ -127,6 +127,7 @@ class TeacherContinuationEngine:
                          If None, uses simulated step or single-turn response.
             chat_fn: LLM call function (defaults to chat_optimizer).
         """
+        call_fn = chat_fn or chat_optimizer
         system_prompt = self.build_teacher_system_prompt(case.skill_content)
         base_user_prompt = self.build_teacher_prefix_prompt(case)
 
@@ -141,7 +142,7 @@ class TeacherContinuationEngine:
                 current_step_num = t_star + step_offset
 
                 # Call Teacher Model
-                raw_response, _ = chat_fn(
+                raw_response, _ = call_fn(
                     system=system_prompt,
                     user=conversation_history,
                     max_completion_tokens=self.max_completion_tokens,
