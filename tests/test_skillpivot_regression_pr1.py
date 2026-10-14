@@ -506,3 +506,124 @@ def test_trainer_skillpivot_final_candidate_gate_lifecycle(tmp_path, monkeypatch
         v1_skill = f.read()
     assert v1_skill.strip() == "# Initial Skill\n1. Check inputs.".strip()
 
+
+# ── 8. Teacher Continuation Environment Step Done & Reward Semantics ──────────
+
+
+def test_teacher_continuation_env_step_reward_and_done_semantics():
+    """Verify teacher continuation accepts positive reward ONLY upon true task completion (done=True).
+
+    Specifically tests:
+    1. Intermediate shaping reward (reward > 0, done=False): teacher does NOT terminate early with 1 step.
+    2. Terminal success (reward > 0, done=True): teacher successfully completes task with full trajectory.
+    3. Zero-reward termination (reward = 0, done=True): teacher terminates as unsuccessful.
+    4. Custom threshold (success_reward_threshold): sub-threshold terminal rewards are rejected.
+    """
+    engine = TeacherContinuationEngine(
+        max_steps=5,
+        max_retries=1,
+        allow_simulated=False,
+        success_reward_threshold=0.0,
+    )
+
+    base_case = PairedSuffixCase(
+        task_id="env_step_task",
+        task_description="Search for document and complete task.",
+        prefix_steps=[],
+        deviation=DeviationPoint(step_index=1, trough_potential=0.0, pre_mean_potential=0.0, post_mean_potential=0.0),
+    )
+
+    # 1. Intermediate shaping reward (reward > 0, done=False) must NOT trigger early success
+    step_calls = []
+
+    def mock_env_shaping_then_done(action):
+        step_calls.append(action)
+        if len(step_calls) == 1:
+            # Step 1: positive shaping reward, but NOT done
+            return "Shaping progress: found candidate", False, 0.2
+        elif len(step_calls) == 2:
+            # Step 2: intermediate progress, still NOT done
+            return "Shaping progress: reading page", False, 0.3
+        else:
+            # Step 3: true terminal completion
+            return "Task completed successfully", True, 1.0
+
+    def mock_chat_search(system, user, **kw):
+        return f"<think>Step {len(step_calls)+1} plan</think><action>read_step_{len(step_calls)+1}</action>", {}
+
+    res_case = engine.run_continuation(
+        base_case,
+        env_step_fn=mock_env_shaping_then_done,
+        chat_fn=mock_chat_search,
+    )
+
+    assert res_case.teacher_success is True
+    # Crucial assertion: must NOT stop at step 1 despite reward=0.2 > 0.0
+    assert len(res_case.teacher_suffix) == 3
+    assert len(step_calls) == 3
+    assert res_case.teacher_suffix[0].reward == 0.2
+    assert res_case.teacher_suffix[0].done is False
+    assert res_case.teacher_suffix[1].reward == 0.3
+    assert res_case.teacher_suffix[1].done is False
+    assert res_case.teacher_suffix[2].reward == 1.0
+    assert res_case.teacher_suffix[2].done is True
+
+    # 2. Terminal success (reward > 0, done=True)
+    def mock_env_one_step_success(action):
+        return "Target reached", True, 1.0
+
+    res_case_success = engine.run_continuation(
+        base_case,
+        env_step_fn=mock_env_one_step_success,
+        chat_fn=mock_chat_search,
+    )
+    assert res_case_success.teacher_success is True
+    assert len(res_case_success.teacher_suffix) == 1
+    assert res_case_success.teacher_suffix[0].done is True
+    assert res_case_success.teacher_suffix[0].reward == 1.0
+
+    # 3. Zero-reward termination (reward = 0, done=True)
+    def mock_env_zero_reward_done(action):
+        return "Timeout: step limit reached without reaching goal", True, 0.0
+
+    res_case_fail = engine.run_continuation(
+        base_case,
+        env_step_fn=mock_env_zero_reward_done,
+        chat_fn=mock_chat_search,
+    )
+    assert res_case_fail.teacher_success is False
+    assert len(res_case_fail.teacher_suffix) == 1
+    assert res_case_fail.teacher_suffix[0].done is True
+    assert res_case_fail.teacher_suffix[0].reward == 0.0
+
+    # 4. Custom threshold (success_reward_threshold=0.5)
+    engine_thresh = TeacherContinuationEngine(
+        max_steps=5,
+        max_retries=1,
+        allow_simulated=False,
+        success_reward_threshold=0.5,
+    )
+
+    # Sub-threshold reward (0.3 <= 0.5) must be rejected
+    def mock_env_sub_thresh(action):
+        return "Partial accomplishment", True, 0.3
+
+    res_case_sub = engine_thresh.run_continuation(
+        base_case,
+        env_step_fn=mock_env_sub_thresh,
+        chat_fn=mock_chat_search,
+    )
+    assert res_case_sub.teacher_success is False
+
+    # Supra-threshold reward (0.8 > 0.5) must pass
+    def mock_env_supra_thresh(action):
+        return "High quality accomplishment", True, 0.8
+
+    res_case_supra = engine_thresh.run_continuation(
+        base_case,
+        env_step_fn=mock_env_supra_thresh,
+        chat_fn=mock_chat_search,
+    )
+    assert res_case_supra.teacher_success is True
+
+

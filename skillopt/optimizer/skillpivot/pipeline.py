@@ -30,9 +30,13 @@ class SkillPivotPipeline:
         verifier: RegressionGatedVerifier | None = None,
         gate_threshold: float = 0.5,
         allow_simulated: bool = False,
+        success_reward_threshold: float = 0.0,
     ):
         self.allow_simulated = allow_simulated
-        self.teacher_engine = teacher_engine or TeacherContinuationEngine(allow_simulated=allow_simulated)
+        self.teacher_engine = teacher_engine or TeacherContinuationEngine(
+            allow_simulated=allow_simulated,
+            success_reward_threshold=success_reward_threshold,
+        )
         self.delta_generator = delta_generator or DeltaGenerator()
         self.verifier = verifier or RegressionGatedVerifier(threshold=gate_threshold)
 

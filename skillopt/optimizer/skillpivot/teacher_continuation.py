@@ -110,12 +110,14 @@ class TeacherContinuationEngine:
         temperature: float = 0.7,
         max_completion_tokens: int = 8192,
         allow_simulated: bool = False,
+        success_reward_threshold: float = 0.0,
     ):
         self.max_steps = max_steps
         self.max_retries = max_retries
         self.temperature = temperature
         self.max_completion_tokens = max_completion_tokens
         self.allow_simulated = allow_simulated
+        self.success_reward_threshold = success_reward_threshold
 
     def build_teacher_system_prompt(self, skill_content: str) -> str:
         """Construct teacher system prompt embedding active skill guidelines."""
@@ -255,17 +257,33 @@ class TeacherContinuationEngine:
                         reward = 0.0
                         exec_st = 0
 
-                    if reward > 0.0:
-                        step_success = True
-                    elif is_finish or done:
-                        # Differentiate episode termination from actual success:
-                        cand_ans = extract_final_answer(action) or extract_final_answer(raw_response) or obs
-                        if evaluator_fn is not None and target_gts:
-                            step_success = bool(evaluator_fn(cand_ans, target_gts))
-                        elif target_gts:
-                            step_success = bool(default_verify_answer(cand_ans, target_gts))
+                    if is_finish:
+                        done = True
+
+                    cand_ans = extract_final_answer(action) or extract_final_answer(raw_response) or obs
+                    has_explicit_ans = bool(extract_final_answer(action) or extract_final_answer(raw_response))
+
+                    # Only verify task success when episode is genuinely done
+                    if done:
+                        if reward > self.success_reward_threshold:
+                            # Environment explicitly reported terminal success
+                            if evaluator_fn is not None and target_gts and has_explicit_ans:
+                                step_success = bool(evaluator_fn(cand_ans, target_gts))
+                            elif target_gts and has_explicit_ans:
+                                step_success = bool(default_verify_answer(cand_ans, target_gts))
+                            else:
+                                step_success = True
                         else:
-                            step_success = False
+                            # Environment did not give positive reward; verify via explicit evaluator or gold answer
+                            if evaluator_fn is not None and target_gts:
+                                step_success = bool(evaluator_fn(cand_ans, target_gts))
+                            elif target_gts:
+                                step_success = bool(default_verify_answer(cand_ans, target_gts))
+                            else:
+                                step_success = False
+                    else:
+                        # Intermediate steps with progress/shaping reward (done=False) do NOT count as task success
+                        step_success = False
                 elif has_verifiable_target:
                     # Verifiable through ground_truth / evaluator without env_step_fn
                     if is_finish:
