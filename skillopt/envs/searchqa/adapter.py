@@ -99,6 +99,8 @@ class SearchQAAdapter(EnvAdapter):
     def build_continuation_step_fn(
         self,
         case: Any,
+        train_env: Any = None,
+        attempt: int = 1,
         **kwargs,
     ) -> Callable[[str], tuple[str, bool, float]] | None:
         """SearchQA is a single-turn question-answering benchmark without an interactive tool environment.
@@ -110,6 +112,7 @@ class SearchQAAdapter(EnvAdapter):
     def build_continuation_evaluator_fn(
         self,
         case: Any,
+        train_env: Any = None,
         **kwargs,
     ) -> Callable[[str, Any], bool] | None:
         """Return SearchQA strict EM evaluator for teacher continuation answer verification."""

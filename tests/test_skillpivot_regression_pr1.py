@@ -1061,4 +1061,244 @@ def test_searchqa_adapter_continuation_hooks_contract():
     assert eval_fn("", ["Einstein"]) is False
 
 
+# ── 15. Round 7 Review Regressions: train_env Context & Teacher Retry Reconstruction ───────
+
+
+def test_trainer_passes_train_env_context_to_adapter_continuation_hooks(tmp_path, monkeypatch):
+    """Verify that Trainer passes train_env context through run_skillpivot_reflect_step
+    to pipeline and adapter.build_continuation_step_fn / build_continuation_evaluator_fn."""
+    from skillopt.envs.base import EnvAdapter
+    from tests.test_deviation_detector import MockEmbeddingProvider
+
+    received_contexts = {
+        "step_fn_train_env": None,
+        "eval_fn_train_env": None,
+    }
+
+    mock_train_env_instance = {
+        "env_type": "batch_docker_sim",
+        "checkpoint_epoch": 2,
+        "active_workers": 4,
+    }
+
+    class ContextCheckingAdapter(EnvAdapter):
+        def build_train_env(self, batch_size, seed, **kwargs):
+            return []
+
+        def build_eval_env(self, env_num, split, seed, **kwargs):
+            return []
+
+        def rollout(self, env_manager, skill_content, out_dir, **kwargs):
+            return []
+
+        def get_task_types(self):
+            return ["interactive"]
+
+        def build_continuation_step_fn(self, case, train_env=None, attempt=1, **kwargs):
+            received_contexts["step_fn_train_env"] = train_env
+            # Simple step function returning success
+            return lambda action: (f"Result for {action}", True, 1.0)
+
+        def build_continuation_evaluator_fn(self, case, train_env=None, **kwargs):
+            received_contexts["eval_fn_train_env"] = train_env
+            return lambda pred, gold: True
+
+    adapter = ContextCheckingAdapter()
+
+    pred_dir = tmp_path / "pred_context_check"
+    tid = "task_ctx_01"
+    (pred_dir / tid).mkdir(parents=True, exist_ok=True)
+    conversation = [
+        {"step": 1, "action": "inspect item", "env_feedback": "error state", "execution_status": 0},
+    ]
+    with open(pred_dir / tid / "conversation.json", "w", encoding="utf-8") as f:
+        json.dump(conversation, f)
+
+    rollout_failed = [
+        {
+            "id": tid,
+            "task_description": "Context check task.",
+            "ground_truth": "",
+            "gold_answers": [],
+            "hard": 0.0,
+            "soft": 0.0,
+        }
+    ]
+
+    def mock_chat(system, user, stage="", **kw):
+        if stage == "teacher_continuation":
+            return "<think>Fix</think><action>do tool action</action>", {}
+        elif stage == "contrast_analysis":
+            return json.dumps({
+                "student_mistake": "Failed inspection",
+                "teacher_correction": "Inspect correctly",
+                "skill_gap": "Need inspection rule",
+                "evolution_direction": "Add inspection rule",
+            }), {}
+        elif stage == "delta_generation":
+            return json.dumps({
+                "action": "improve_skill",
+                "target_rule": "Inspection",
+                "content": "Always verify tool parameters before inspection.",
+                "trigger_condition": "During inspection",
+                "rationale": "Ensures success",
+            }), {}
+        elif stage == "regression_verification":
+            return json.dumps({
+                "no_regression_score": 0.95,
+                "generalizable_rule_score": 0.95,
+                "critique": "Valid inspection rule",
+            }), {}
+        return "", {}
+
+    from skillopt.optimizer.skillpivot import delta_generator, regression_verifier, teacher_continuation
+    monkeypatch.setattr(teacher_continuation, "chat_optimizer", mock_chat)
+    monkeypatch.setattr(delta_generator, "chat_optimizer", mock_chat)
+    monkeypatch.setattr(regression_verifier, "chat_optimizer", mock_chat)
+
+    cfg = {
+        "optimizer_type": "skillpivot",
+        "skillpivot_embedding_backend": "local",
+        "skillpivot_gate_threshold": 0.5,
+        "skillpivot_teacher_max_steps": 3,
+        "skillpivot_success_reward_threshold": 0.0,
+    }
+
+    raw_patches = run_skillpivot_reflect_step(
+        rollout_results=rollout_failed,
+        current_skill="# Base Skill",
+        prediction_dir=str(pred_dir),
+        cfg=cfg,
+        adapter=adapter,
+        embedding_provider=MockEmbeddingProvider(),
+        allow_simulated=False,
+        train_env=mock_train_env_instance,
+    )
+
+    assert len(raw_patches) == 1
+    # Verify train_env was strictly and accurately delivered to both hooks
+    assert received_contexts["step_fn_train_env"] is mock_train_env_instance
+    assert received_contexts["eval_fn_train_env"] is mock_train_env_instance
+
+
+def test_teacher_continuation_retries_with_stateful_environment_reconstruction():
+    """Verify that when attempt 1 ends with done=True, reward=0 (failure termination),
+    TeacherContinuationEngine rebuilds / resets stateful environment for attempt 2,
+    allowing successful continuation from the same deviation point t* without encountering
+    'Episode already terminated' error.
+
+    Regression test for round 7 review P1 finding:
+    Stateful adapter where attempt 1 action terminates with failure, and subsequent attempt 2
+    action must run on fresh/reset state to succeed.
+    """
+    class StatefulEnvironment:
+        def __init__(self, task_id: str):
+            self.task_id = task_id
+            self.is_terminated = False
+            self.actions_received = []
+
+        def step(self, action: str):
+            self.actions_received.append(action)
+            if self.is_terminated:
+                # Real stateful environments reject actions after terminal status
+                return "Episode already terminated: invalid action after done=True", True, 0.0
+
+            if action == "wrong action":
+                self.is_terminated = True
+                return "Trap triggered! Mission failed.", True, 0.0
+            elif action == "correct action":
+                self.is_terminated = True
+                return "Key turned, door opened successfully!", True, 1.0
+            else:
+                return f"Obs: {action}", False, 0.0
+
+    from skillopt.envs.base import EnvAdapter
+
+    class StatefulAdapter(EnvAdapter):
+        def __init__(self):
+            super().__init__()
+            self.envs_created = []
+
+        def build_train_env(self, batch_size, seed, **kwargs):
+            return []
+
+        def build_eval_env(self, env_num, split, seed, **kwargs):
+            return []
+
+        def rollout(self, env_manager, skill_content, out_dir, **kwargs):
+            return []
+
+        def get_task_types(self):
+            return ["stateful"]
+
+        def build_continuation_step_fn(self, case, train_env=None, attempt=1, **kwargs):
+            # Construct a brand new stateful environment per attempt from deviation point t*
+            env = StatefulEnvironment(case.task_id)
+            self.envs_created.append((attempt, env))
+            return env.step
+
+    adapter = StatefulAdapter()
+
+    engine = TeacherContinuationEngine(
+        max_steps=5,
+        max_retries=2,
+        allow_simulated=False,
+        success_reward_threshold=0.0,
+    )
+
+    case = PairedSuffixCase(
+        task_id="task_stateful_door",
+        task_description="Open the locked door safely.",
+        ground_truth="",
+        gold_answers=[],
+        prefix_steps=[],
+        deviation=DeviationPoint(step_index=1, trough_potential=0.0, pre_mean_potential=0.0, post_mean_potential=0.0),
+    )
+
+    attempt_counter = 0
+
+    def mock_chat_retry(system, user, **kw):
+        nonlocal attempt_counter
+        # On attempt 1, model outputs wrong action leading to termination
+        # On attempt 2, model outputs correct action leading to success
+        if attempt_counter == 0:
+            attempt_counter += 1
+            return "<think>Try force</think><action>wrong action</action>", {}
+        else:
+            attempt_counter += 1
+            return "<think>Try right key</think><action>correct action</action>", {}
+
+    res = engine.run_continuation(
+        case,
+        chat_fn=mock_chat_retry,
+        adapter=adapter,
+    )
+
+    assert res.teacher_success is True
+    # Verify that two attempts took place and two environment instances were created
+    assert len(adapter.envs_created) == 2
+    assert adapter.envs_created[0][0] == 1
+    assert adapter.envs_created[1][0] == 2
+
+    env_attempt1 = adapter.envs_created[0][1]
+    env_attempt2 = adapter.envs_created[1][1]
+
+    # Attempt 1 failed with trap
+    assert env_attempt1.actions_received == ["wrong action"]
+    assert env_attempt1.is_terminated is True
+
+    # Attempt 2 ran on fresh environment from t* and succeeded
+    assert env_attempt2.actions_received == ["correct action"]
+    assert env_attempt2.is_terminated is True
+
+    # Verify final teacher suffix reflects successful attempt 2
+    assert len(res.teacher_suffix) == 1
+    assert res.teacher_suffix[0].action == "correct action"
+    assert "door opened successfully" in res.teacher_suffix[0].observation
+    assert res.teacher_suffix[0].done is True
+    assert res.teacher_suffix[0].reward == 1.0
+    assert res.teacher_suffix[0].execution_status == 1
+
+
+
 

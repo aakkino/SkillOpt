@@ -50,6 +50,8 @@ class SkillPivotPipeline:
         evaluator_fn: Callable[[str, Any], bool] | None = None,
         allow_simulated: bool | None = None,
         adapter: Any = None,
+        train_env: Any = None,
+        **kwargs,
     ) -> tuple[str, list[SkillDelta], list[RegressionGateResult]]:
         """Run one optimization iteration across a batch of failed cases.
 
@@ -64,32 +66,58 @@ class SkillPivotPipeline:
         sim_allowed = self.allow_simulated if allow_simulated is None else allow_simulated
 
         for case in paired_cases:
-            # Resolve task-specific step function
-            case_env_step_fn = None
-            if callable(env_step_fn):
-                try:
-                    import inspect
-                    sig = inspect.signature(env_step_fn)
-                    if len(sig.parameters) >= 1 and list(sig.parameters.keys())[0] in ("case", "task_case", "paired_case"):
-                        case_env_step_fn = env_step_fn(case)
-                    else:
-                        case_env_step_fn = env_step_fn
-                except Exception:
-                    case_env_step_fn = env_step_fn
-            elif adapter is not None and hasattr(adapter, "build_continuation_step_fn"):
-                try:
-                    case_env_step_fn = adapter.build_continuation_step_fn(case)
-                except Exception as e:
-                    logger.warning(f"Task {case.task_id}: failed to build continuation step fn from adapter: {e}")
-                    case_env_step_fn = None
+            def _step_fn_builder(attempt: int = 1):
+                if callable(env_step_fn):
+                    try:
+                        import inspect
+                        sig = inspect.signature(env_step_fn)
+                        params = list(sig.parameters.keys())
+                        if len(params) >= 2 and params[0] in ("case", "task_case", "paired_case") and params[1] in ("attempt", "retry"):
+                            return env_step_fn(case, attempt)
+                        elif len(params) >= 1 and params[0] in ("case", "task_case", "paired_case"):
+                            return env_step_fn(case)
+                        elif len(params) >= 1 and params[0] in ("attempt", "retry"):
+                            return env_step_fn(attempt)
+                        else:
+                            return env_step_fn
+                    except Exception:
+                        return env_step_fn
+                elif adapter is not None and hasattr(adapter, "build_continuation_step_fn"):
+                    try:
+                        return adapter.build_continuation_step_fn(
+                            case,
+                            train_env=train_env,
+                            attempt=attempt,
+                            **kwargs,
+                        )
+                    except TypeError:
+                        try:
+                            return adapter.build_continuation_step_fn(case, train_env=train_env)
+                        except TypeError:
+                            return adapter.build_continuation_step_fn(case)
+                    except Exception as e:
+                        logger.warning(f"Task {case.task_id}: failed to build continuation step fn from adapter: {e}")
+                        return None
+                return None
 
             # Resolve task-specific evaluator function
             case_evaluator_fn = evaluator_fn
             if adapter is not None and hasattr(adapter, "build_continuation_evaluator_fn"):
                 try:
-                    adapter_eval = adapter.build_continuation_evaluator_fn(case)
+                    adapter_eval = adapter.build_continuation_evaluator_fn(
+                        case,
+                        train_env=train_env,
+                        **kwargs,
+                    )
                     if adapter_eval is not None:
                         case_evaluator_fn = adapter_eval
+                except TypeError:
+                    try:
+                        adapter_eval = adapter.build_continuation_evaluator_fn(case)
+                        if adapter_eval is not None:
+                            case_evaluator_fn = adapter_eval
+                    except Exception:
+                        pass
                 except Exception:
                     pass
 
@@ -97,9 +125,12 @@ class SkillPivotPipeline:
             if not case.teacher_success or not case.teacher_suffix:
                 case = self.teacher_engine.run_continuation(
                     case,
-                    env_step_fn=case_env_step_fn,
+                    env_step_fn=_step_fn_builder(1),
                     evaluator_fn=case_evaluator_fn,
                     allow_simulated=sim_allowed,
+                    adapter=adapter,
+                    train_env=train_env,
+                    env_step_fn_builder=_step_fn_builder,
                 )
 
             if not case.teacher_success:

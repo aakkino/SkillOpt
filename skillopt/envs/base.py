@@ -334,25 +334,52 @@ class EnvAdapter(ABC):
     def build_continuation_step_fn(
         self,
         case: Any,
+        train_env: Any = None,
+        attempt: int = 1,
         **kwargs,
     ) -> Callable[[str], tuple[str, bool, float]] | None:
         """Build an environment step function for teacher continuation from deviation point t*.
 
         For interactive environments that maintain or can reconstruct simulation state
-        (e.g., by replaying prefix_steps or restoring checkpoint), override this method
-        to return a callable: action -> (observation: str, is_done: bool, reward: float).
+        (e.g., by replaying prefix_steps, restoring checkpoint, or slicing from train_env),
+        override this method to return a callable: action -> (observation: str, is_done: bool, reward: float).
+
+        Args:
+            case: PairedSuffixCase containing prefix steps and task information.
+            train_env: Active environment manager/context (from Trainer).
+            attempt: Current retry attempt (1-indexed), allowing stateful reconstruction per retry.
+            **kwargs: Additional contextual arguments.
 
         Default implementation returns None, indicating the environment is stateless,
         single-turn QA, or operates in direct answer takeover mode.
         """
         return None
 
+    def reset_continuation_env(
+        self,
+        case: Any,
+        train_env: Any = None,
+        attempt: int = 1,
+        **kwargs,
+    ) -> None:
+        """Reset or rollback environment state for a new teacher continuation attempt.
+
+        Override in stateful environments if in-place reset is preferred over rebuilding step_fn.
+        """
+        pass
+
     def build_continuation_evaluator_fn(
         self,
         case: Any,
+        train_env: Any = None,
         **kwargs,
     ) -> Callable[[str, Any], bool] | None:
         """Build a task-specific answer verification evaluator for teacher continuation.
+
+        Args:
+            case: PairedSuffixCase or None for global evaluator.
+            train_env: Active environment manager/context (from Trainer).
+            **kwargs: Additional contextual arguments.
 
         Default implementation returns None, falling back to built-in exact matching or
         standard benchmark evaluator.

@@ -205,6 +205,10 @@ class TeacherContinuationEngine:
         evaluator_fn: Callable[[str, Any], bool] | None = None,
         chat_fn: Callable[..., tuple[str, dict]] | None = None,
         allow_simulated: bool | None = None,
+        adapter: Any = None,
+        train_env: Any = None,
+        env_step_fn_builder: Callable[[int], Callable[[str], tuple[str, bool, float]] | None] | None = None,
+        env_reset_fn: Callable[..., None] | None = None,
     ) -> PairedSuffixCase:
         """Execute teacher continuation from t* for up to max_steps turns.
 
@@ -214,6 +218,10 @@ class TeacherContinuationEngine:
             evaluator_fn: Optional callable(predicted_answer, ground_truth) -> bool.
             chat_fn: LLM call function (defaults to chat_optimizer).
             allow_simulated: Explicit flag whether unverified simulated execution is accepted.
+            adapter: Optional EnvAdapter providing continuation environment step/evaluator hooks.
+            train_env: Optional active training environment manager/context.
+            env_step_fn_builder: Optional factory callable(attempt) -> env_step_fn to rebuild stateful environment per retry.
+            env_reset_fn: Optional callable(attempt) -> None to reset stateful environment per retry.
         """
         call_fn = chat_fn or chat_optimizer
         task_type = getattr(case, "task_type", "") or case.extras.get("task_type", "")
@@ -234,6 +242,58 @@ class TeacherContinuationEngine:
             teacher_steps: list[TrajectoryStep] = []
             conversation_history = base_user_prompt
             success = False
+
+            # Resolve / rebuild environment step function for this attempt
+            active_env_step_fn = None
+            if env_step_fn_builder is not None:
+                try:
+                    active_env_step_fn = env_step_fn_builder(attempt)
+                except Exception as e:
+                    logger.warning(f"Task {case.task_id}: env_step_fn_builder error on attempt {attempt}: {e}")
+                    active_env_step_fn = None
+            elif adapter is not None and hasattr(adapter, "build_continuation_step_fn"):
+                if attempt > 1 and hasattr(adapter, "reset_continuation_env"):
+                    try:
+                        adapter.reset_continuation_env(case, train_env=train_env, attempt=attempt)
+                    except TypeError:
+                        try:
+                            adapter.reset_continuation_env(case)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                try:
+                    active_env_step_fn = adapter.build_continuation_step_fn(
+                        case,
+                        train_env=train_env,
+                        attempt=attempt,
+                    )
+                except TypeError:
+                    try:
+                        active_env_step_fn = adapter.build_continuation_step_fn(case, train_env=train_env)
+                    except TypeError:
+                        active_env_step_fn = adapter.build_continuation_step_fn(case)
+                except Exception as e:
+                    logger.warning(f"Task {case.task_id}: failed to rebuild step fn on attempt {attempt}: {e}")
+                    active_env_step_fn = None
+            elif env_step_fn is not None:
+                active_env_step_fn = env_step_fn
+                if attempt > 1:
+                    if env_reset_fn is not None:
+                        try:
+                            env_reset_fn(attempt)
+                        except TypeError:
+                            env_reset_fn()
+                    elif hasattr(active_env_step_fn, "reset") and callable(active_env_step_fn.reset):
+                        try:
+                            active_env_step_fn.reset(attempt)
+                        except TypeError:
+                            active_env_step_fn.reset()
+                    elif hasattr(getattr(active_env_step_fn, "__self__", None), "reset"):
+                        try:
+                            active_env_step_fn.__self__.reset(attempt)
+                        except TypeError:
+                            active_env_step_fn.__self__.reset()
 
             for step_offset in range(self.max_steps):
                 current_step_num = t_star + step_offset
@@ -258,9 +318,9 @@ class TeacherContinuationEngine:
 
                 step_success = False
 
-                if env_step_fn is not None:
+                if active_env_step_fn is not None:
                     try:
-                        obs, done, reward = env_step_fn(action)
+                        obs, done, reward = active_env_step_fn(action)
                         exec_st = 0 if "error" in obs.lower() or not obs.strip() else 1
                     except Exception as e:
                         obs = f"Execution error: {e}"
