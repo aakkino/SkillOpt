@@ -253,6 +253,7 @@ def run_skillpivot_reflect_step(
             gate_threshold=gate_thresh,
             allow_simulated=allow_simulated,
             success_reward_threshold=float(cfg.get("skillpivot_success_reward_threshold", 0.0)),
+            teacher_max_steps=int(cfg.get("skillpivot_teacher_max_steps", 10)),
         )
     _, accepted_deltas, gate_results = pipeline.optimize_step(
         paired_cases=paired_cases,

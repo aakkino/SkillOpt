@@ -10,3 +10,4 @@ optimizer:
   skillpivot_w_div: 0.2
   skillpivot_teacher_max_steps: 10
   skillpivot_gate_threshold: 0.5
+  skillpivot_success_reward_threshold: 0.0

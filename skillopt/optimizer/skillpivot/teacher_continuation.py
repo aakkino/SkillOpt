@@ -257,9 +257,7 @@ class TeacherContinuationEngine:
                         reward = 0.0
                         exec_st = 0
 
-                    if is_finish:
-                        done = True
-
+                    # Respect environment terminal status; do not override done=False on teacher FINISH
                     cand_ans = extract_final_answer(action) or extract_final_answer(raw_response) or obs
                     has_explicit_ans = bool(extract_final_answer(action) or extract_final_answer(raw_response))
 

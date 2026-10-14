@@ -173,6 +173,7 @@ _FLATTEN_MAP: dict[str, str] = {
     "optimizer.skillpivot_w_div": "skillpivot_w_div",
     "optimizer.skillpivot_teacher_max_steps": "skillpivot_teacher_max_steps",
     "optimizer.skillpivot_gate_threshold": "skillpivot_gate_threshold",
+    "optimizer.skillpivot_success_reward_threshold": "skillpivot_success_reward_threshold",
     "evaluation.use_gate": "use_gate",
     "evaluation.gate_metric": "gate_metric",
     "evaluation.gate_mixed_weight": "gate_mixed_weight",

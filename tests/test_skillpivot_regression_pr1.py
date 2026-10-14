@@ -11,6 +11,7 @@ import json
 import os
 import pytest
 
+from skillopt.config import flatten_config, load_config
 from skillopt.deviation_detector import DeviationDetector
 from skillopt.engine.trainer import run_skillpivot_reflect_step
 from skillopt.optimizer.skill import apply_edit, apply_patch_with_report
@@ -625,5 +626,243 @@ def test_teacher_continuation_env_step_reward_and_done_semantics():
         chat_fn=mock_chat_search,
     )
     assert res_case_supra.teacher_success is True
+
+
+def test_teacher_continuation_respects_env_done_on_finish_action():
+    """Verify teacher FINISH action does NOT override env done=False to trigger false early success."""
+    base_case = PairedSuffixCase(
+        task_id="finish_env_done_task",
+        task_description="Multi-step interactive environment task.",
+        prefix_steps=[],
+        deviation=DeviationPoint(step_index=1, trough_potential=0.0, pre_mean_potential=0.0, post_mean_potential=0.0),
+    )
+
+    def mock_chat_finish(system, user, **kw):
+        return "<think>Premature completion</think><action>FINISH: done</action>", {}
+
+    # Scenario A: Teacher emits FINISH, environment returns done=False with positive shaping reward.
+    # Must NOT stop at step 1 and must NOT declare success!
+    call_count_a = 0
+
+    def mock_env_finish_not_done_positive_reward(action):
+        nonlocal call_count_a
+        call_count_a += 1
+        return "Task still in progress (step not terminal)", False, 0.1
+
+    engine_a = TeacherContinuationEngine(
+        max_steps=3,
+        max_retries=1,
+        allow_simulated=False,
+        success_reward_threshold=0.0,
+    )
+
+    res_case_a = engine_a.run_continuation(
+        base_case,
+        env_step_fn=mock_env_finish_not_done_positive_reward,
+        chat_fn=mock_chat_finish,
+    )
+
+    assert res_case_a.teacher_success is False
+    assert len(res_case_a.teacher_suffix) == 3
+    assert call_count_a == 3
+    for s in res_case_a.teacher_suffix:
+        assert s.done is False
+        assert s.reward == 0.1
+
+    # Scenario B: Teacher emits FINISH, environment returns done=False with zero reward.
+    call_count_b = 0
+
+    def mock_env_finish_not_done_zero_reward(action):
+        nonlocal call_count_b
+        call_count_b += 1
+        return "Task not finished", False, 0.0
+
+    res_case_b = engine_a.run_continuation(
+        base_case,
+        env_step_fn=mock_env_finish_not_done_zero_reward,
+        chat_fn=mock_chat_finish,
+    )
+    assert res_case_b.teacher_success is False
+    assert len(res_case_b.teacher_suffix) == 3
+    assert call_count_b == 3
+
+    # Scenario C: Teacher emits FINISH, environment confirms true completion (done=True).
+    def mock_env_finish_genuinely_done(action):
+        return "Task successfully completed", True, 1.0
+
+    res_case_c = engine_a.run_continuation(
+        base_case,
+        env_step_fn=mock_env_finish_genuinely_done,
+        chat_fn=mock_chat_finish,
+    )
+    assert res_case_c.teacher_success is True
+    assert len(res_case_c.teacher_suffix) == 1
+    assert res_case_c.teacher_suffix[0].done is True
+
+
+def test_skillpivot_teacher_max_steps_wiring_and_bounds():
+    """Verify skillpivot_teacher_max_steps is wired through Pipeline and bounds teacher rollouts."""
+    base_case = PairedSuffixCase(
+        task_id="step_bound_task",
+        task_description="Search and solve.",
+        prefix_steps=[],
+        deviation=DeviationPoint(step_index=1, trough_potential=0.0, pre_mean_potential=0.0, post_mean_potential=0.0),
+    )
+
+    # 1. Pipeline wiring check
+    pipe_3 = SkillPivotPipeline(teacher_max_steps=3)
+    assert pipe_3.teacher_engine.max_steps == 3
+
+    pipe_7 = SkillPivotPipeline(teacher_max_steps=7)
+    assert pipe_7.teacher_engine.max_steps == 7
+
+    # 2. Execution bounds check with non-terminating environment
+    def mock_chat_search(system, user, **kw):
+        return "<think>Explore</think><action>read_item</action>", {}
+
+    def mock_env_never_done(action):
+        return "read result", False, 0.0
+
+    res_3 = pipe_3.teacher_engine.run_continuation(
+        base_case,
+        env_step_fn=mock_env_never_done,
+        chat_fn=mock_chat_search,
+    )
+    assert len(res_3.teacher_suffix) == 3
+    assert res_3.teacher_success is False
+
+    res_5 = TeacherContinuationEngine(max_steps=5, allow_simulated=False).run_continuation(
+        base_case,
+        env_step_fn=mock_env_never_done,
+        chat_fn=mock_chat_search,
+    )
+    assert len(res_5.teacher_suffix) == 5
+    assert res_5.teacher_success is False
+
+
+def test_skillpivot_config_flattening_and_pipeline_wiring(tmp_path):
+    """Verify optimizer.skillpivot_success_reward_threshold and teacher_max_steps flatten and propagate."""
+    # 1. Verify searchqa/skillpivot.yaml flattens all SkillPivot keys properly
+    yaml_path = "configs/searchqa/skillpivot.yaml"
+    cfg = load_config(yaml_path)
+    flat = flatten_config(cfg)
+
+    assert "skillpivot_success_reward_threshold" in flat
+    assert flat["skillpivot_success_reward_threshold"] == 0.0
+    assert flat["skillpivot_teacher_max_steps"] == 10
+    assert flat["skillpivot_gate_threshold"] == 0.5
+
+    # 2. Verify structured config override flattening
+    structured_cfg = {
+        "optimizer": {
+            "type": "skillpivot",
+            "skillpivot_success_reward_threshold": 0.75,
+            "skillpivot_teacher_max_steps": 4,
+            "skillpivot_gate_threshold": 0.6,
+        }
+    }
+    flat_custom = flatten_config(structured_cfg)
+    assert flat_custom["skillpivot_success_reward_threshold"] == 0.75
+    assert flat_custom["skillpivot_teacher_max_steps"] == 4
+    assert flat_custom["skillpivot_gate_threshold"] == 0.6
+
+    # 3. Verify trainer reflects teacher_max_steps and success_reward_threshold into pipeline
+    tid = "task_config_prop"
+    conversation = [
+        {"role": "user", "content": "Question: Find the answer"},
+        {"role": "assistant", "content": "<think>browse 1</think><action>browse</action>"},
+        {"role": "user", "content": "Observation: error"},
+        {"role": "assistant", "content": "<think>browse 2</think><action>browse</action>"},
+        {"role": "user", "content": "Observation: error"},
+    ]
+
+    rollout_failed = [
+        {
+            "id": tid,
+            "task_description": "An interactive environment task.",
+            "ground_truth": "",
+            "gold_answers": [],
+            "hard": 0.0,
+            "soft": 0.0,
+        }
+    ]
+
+    pred_sub = tmp_path / "pred_sub"
+    (pred_sub / tid).mkdir(parents=True, exist_ok=True)
+    with open(pred_sub / tid / "conversation.json", "w", encoding="utf-8") as f:
+        json.dump(conversation, f)
+
+    pred_supra = tmp_path / "pred_supra"
+    (pred_supra / tid).mkdir(parents=True, exist_ok=True)
+    with open(pred_supra / tid / "conversation.json", "w", encoding="utf-8") as f:
+        json.dump(conversation, f)
+
+    # Sub-threshold reward (0.5 <= 0.75) must NOT succeed in teacher continuation
+    def mock_env_sub(action):
+        return "Sub threshold terminal", True, 0.5
+
+    # Supra-threshold reward (0.9 > 0.75) with valid teacher should succeed continuation
+    def mock_env_supra(action):
+        return "Supra threshold terminal", True, 0.9
+
+    def mock_chat_custom(system, user, stage="", **kw):
+        if stage == "teacher_continuation":
+            return "<think>Solve</think><action>submit_solution</action>", {}
+        elif stage == "contrast_analysis":
+            return json.dumps({
+                "student_mistake": "Repeated browse error",
+                "teacher_correction": "Extracted Gold Answer",
+                "skill_gap": "Need planning rule",
+                "evolution_direction": "Add planning before action",
+            }), {}
+        elif stage == "delta_generation":
+            return json.dumps({
+                "action": "improve_skill",
+                "target_rule": "Planning",
+                "content": "Plan carefully before browsing.",
+                "trigger_condition": "When receiving complex reasoning query",
+                "rationale": "Prevents browse loop",
+            }), {}
+        elif stage == "regression_verification":
+            return json.dumps({
+                "no_regression_score": 0.9,
+                "generalizable_rule_score": 0.9,
+                "critique": "Solid improvement",
+            }), {}
+        return "", {}
+
+    from skillopt.optimizer.skillpivot import (
+        delta_generator,
+        regression_verifier,
+        teacher_continuation,
+    )
+
+    import unittest.mock
+    with unittest.mock.patch.object(teacher_continuation, "chat_optimizer", side_effect=mock_chat_custom), \
+         unittest.mock.patch.object(delta_generator, "chat_optimizer", side_effect=mock_chat_custom), \
+         unittest.mock.patch.object(regression_verifier, "chat_optimizer", side_effect=mock_chat_custom):
+        deltas_sub = run_skillpivot_reflect_step(
+            rollout_results=rollout_failed,
+            current_skill="# Base Skill",
+            prediction_dir=str(pred_sub),
+            cfg=flat_custom,
+            env_step_fn=mock_env_sub,
+            embedding_provider=MockEmbeddingProvider(),
+            allow_simulated=False,
+        )
+        assert len(deltas_sub) == 0
+
+        deltas_supra = run_skillpivot_reflect_step(
+            rollout_results=rollout_failed,
+            current_skill="# Base Skill",
+            prediction_dir=str(pred_supra),
+            cfg=flat_custom,
+            env_step_fn=mock_env_supra,
+            embedding_provider=MockEmbeddingProvider(),
+            allow_simulated=False,
+        )
+        assert len(deltas_supra) == 1
+        assert "Plan carefully before browsing" in deltas_supra[0]["patch"]["edits"][0]["content"]
+
 
 
